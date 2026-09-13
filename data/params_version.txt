@@ -1,0 +1,6 @@
+CDR-2025
+
+Extracted from the appendix of the SPIE paper "CHIME System Performance at
+Critical Design Review: A parametric model for end-to-end simulation
+analysis" (Fernandez Nunez et al., ESA-ESTEC / OHB System AG / ESA-ESRIN)
+and verified row by row. Treat as read-only inputs.   

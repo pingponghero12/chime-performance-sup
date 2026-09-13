@@ -1,0 +1,24 @@
+# CHIME excluded regions for requirement-compliance plotting.
+#
+# [IMPL CHOICE] These bounds are NOT given in the paper or in
+# docs/CHIME_PROTOTYPE_SPEC.md. Spec section 3.2 states only that requirement
+# evaluation excludes "greyed regions (high atmospheric absorption windows and
+# far SWIR)". The bounds below were derived from the Lref column of
+# data/chime_channel_params.csv by the reproducible rule:
+#
+#   1. flag channels with Lref < 2% of max(Lref)  (threshold 2.7980 W sr-1 m-2 um-1)
+#   2. merge contiguous flagged runs separated by gaps < 50 nm
+#   3. drop merged runs shorter than 3 channels
+#
+# Replace this file with the paper's exact greyed bands when available. This is
+# a DATA edit, never a code edit (CLAUDE.md non-negotiable #2).
+#
+# These regions are PLOTTING METADATA ONLY. The model still computes values
+# inside them; the exclusion applies solely to compliance figures
+# (spec pitfall 9.8).
+#
+# Bounds are inclusive channel centres, in nm.
+lower_nm,upper_nm,label
+1345.0,1479.4,water vapour absorption band near 1.4 um
+1790.2,2067.4,water vapour absorption band near 1.9 um
+2319.4,2495.8,far SWIR low-radiance region

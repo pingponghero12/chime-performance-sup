@@ -1,0 +1,15 @@
+#ARA parameters
+k : 0.025
+S0 : 150
+
+#PSF parameters
+
+MTF_ACT : 0.25
+MTF_ALT : 0.28
+
+#ISRF parameters
+ISRF_FWHM: 10.0
+
+# RXRA fraction, not percent: 0.004 = 0.4%
+RXRA_DEFAULT: 0.004
+ 
