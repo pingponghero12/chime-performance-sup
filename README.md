@@ -55,7 +55,8 @@ python -m build
 ```
 
 The release workflow builds both files and tests the installed package on Linux,
-Windows, Intel Mac and Apple Silicon with Python 3.10–3.12. Publishing a GitHub release
+Windows, Intel Mac and Apple Silicon with Python 3.12. The separate unit-test workflow
+checks Python 3.10–3.12 on Linux. Publishing a GitHub release
 tagged `v0.1.0` attaches the files once those checks pass. No registry publishing is configured.
 
 ## Use
