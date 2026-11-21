@@ -1,5 +1,6 @@
 """Spatial interpolation, spectral interpolation and spectral-library reconstruction."""
 
+import dask.array as da
 import numpy as np
 import xarray as xr
 from eopl import image_t
@@ -8,6 +9,7 @@ from scipy.interpolate import interp1d
 from scipy.optimize import nnls
 
 from .algorithms import grid, reflectance_image
+from .backends import select_backend, tile_call, tiles
 
 
 def spatial_grid(coordinates, detector_spacing_m, oversampling="auto"):
@@ -55,7 +57,7 @@ def validate_spatial_sampling(data, detector_spacing_m):
             )
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def interpolate_spatial_axis(values, source_m, target_m, axis):
     """Apply linear interpolation along ACT or ALT without full-image temporaries."""
     shape = list(values.shape)
@@ -85,9 +87,12 @@ def interpolate_spatial_axis(values, source_m, target_m, axis):
     return result
 
 
-def interpolate_spatial(data, detector_spacing_m=30.0, oversampling="auto"):
+def interpolate_spatial(data, detector_spacing_m=30.0, oversampling="auto", backend=None):
     """Interpolate ACT and ALT onto grids with integer spatial oversampling."""
+    backend = select_backend(data, backend)
     source = data.image().transpose("ACT", "ALT", "SPE")
+    if backend == "dask" and not data.is_dask:
+        source = source.chunk({"ACT": 128, "ALT": 128, "SPE": -1})
 
     act, factor_act = spatial_grid(source.ACT.values, detector_spacing_m, oversampling)
     alt, factor_alt = spatial_grid(source.ALT.values, detector_spacing_m, oversampling)
@@ -103,7 +108,10 @@ def interpolate_spatial(data, detector_spacing_m=30.0, oversampling="auto"):
         if np.array_equal(target, original):
             continue
 
-        values = interpolate_spatial_axis(result.values, original, target, axis)
+        if backend == "dask":
+            values = interpolate_spatial_dask(result.data, original, target, axis)
+        else:
+            values = interpolate_spatial_axis(result.values, original, target, axis)
 
         # Xarray handles coordinate attributes and auxiliary coordinates only;
         # Numba applies the image equation into one preallocated output array.
@@ -128,13 +136,30 @@ def interpolate_spatial(data, detector_spacing_m=30.0, oversampling="auto"):
     return image_t(result)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 interpolate_spatial.cuda_support = False
-interpolate_spatial.dask_support = False
+interpolate_spatial.dask_support = True
 interpolate_spatial.input_access = ("read",)
 
 
-@njit(cache=True)
+def interpolate_spatial_dask(values, original, target, axis):
+    values = da.asarray(values)
+    shape = list(values.shape)
+    shape[axis] = len(target)
+
+    def make_tile(xs, ys):
+        selection = [xs, ys]
+        points = target[selection[axis]]
+        # Use the same brackets as the reference kernel, across chunk edges too.
+        upper = np.searchsorted(original, points).clip(1, len(original) - 1)
+        neighbours = slice(upper.min() - 1, upper.max() + 1)
+        selection[axis] = neighbours
+        pixels = values[tuple(selection)]
+        return tile_call(interpolate_spatial_axis, pixels, original[neighbours], points, axis)
+
+    return tiles(values, shape, make_tile)
+
+
+@njit(cache=True, nogil=True)
 def interpolate_spectra(spectra, wavelength_nm, target_nm):
     """Evaluate the same straight-line spectral interpolant at every pixel."""
     result = np.empty((len(spectra), len(target_nm)))
@@ -145,19 +170,20 @@ def interpolate_spectra(spectra, wavelength_nm, target_nm):
     return result
 
 
-def interpolate_spectral(data, step_nm=None):
+def interpolate_spectral(data, step_nm=None, backend=None):
     """Interpolate each pixel spectrum onto the requested SPE grid."""
     source = data.image().transpose("ACT", "ALT", "SPE")
 
     source_nm = grid(source.SPE.values)
     target_nm = grid(source_nm, step_nm)
 
-    # Each row contains one pixel spectrum. Numba only compiles this small loop.
-    spectra = source.values.reshape(-1, len(source_nm))
-    result = interpolate_spectra(spectra, source_nm, target_nm)
+    if select_backend(data, backend) == "dask":
+        result = interpolate_spectral_dask(source.data, source_nm, target_nm)
+    else:
+        result = interpolate_spectral_python(source.values, source_nm, target_nm)
 
     image = xr.DataArray(
-        result.reshape(len(source.ACT), len(source.ALT), len(target_nm)),
+        result,
         dims=("ACT", "ALT", "SPE"),
         coords={"ACT": source.ACT, "ALT": source.ALT, "SPE": target_nm},
         name=source.name,
@@ -168,13 +194,31 @@ def interpolate_spectral(data, step_nm=None):
     return image_t(image)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 interpolate_spectral.cuda_support = False
-interpolate_spectral.dask_support = False
+interpolate_spectral.dask_support = True
 interpolate_spectral.input_access = ("read",)
 
 
-def fit_library(data, library):
+def interpolate_spectral_python(values, source_nm, target_nm):
+    # Each row contains one pixel spectrum.
+    spectra = values.reshape(-1, len(source_nm))
+    result = interpolate_spectra(spectra, source_nm, target_nm)
+    return result.reshape(*values.shape[:2], len(target_nm))
+
+
+def interpolate_spectral_dask(values, source_nm, target_nm):
+    values = da.asarray(values).rechunk({2: -1})
+    return values.map_blocks(
+        interpolate_spectral_python,
+        source_nm=source_nm,
+        target_nm=target_nm,
+        chunks=(*values.chunks[:2], (len(target_nm),)),
+        dtype=float,
+        meta=np.empty((0, 0, 0)),
+    )
+
+
+def fit_library(data, library, backend=None):
     """Fit non-negative library weights independently at each spatial pixel."""
     reflectance = reflectance_image(data)
     measured = library["measured"].transpose("SPE", "material")
@@ -186,16 +230,10 @@ def fit_library(data, library):
     if not np.isfinite(measured.values).all():
         raise ValueError("Measured-band library values must be finite.")
 
-    weights = np.full(
-        (len(reflectance.ACT), len(reflectance.ALT), len(measured.material)), np.nan
-    )
-
-    for act in range(len(reflectance.ACT)):
-        for alt in range(len(reflectance.ALT)):
-            spectrum = reflectance.values[act, alt, :]
-
-            if np.isfinite(spectrum).all():
-                weights[act, alt, :] = nnls(measured.values, spectrum)[0]
+    if select_backend(data, backend) == "dask":
+        weights = fit_library_dask(reflectance.data, measured.values)
+    else:
+        weights = fit_library_python(reflectance.values, measured.values)
 
     image = xr.DataArray(
         weights,
@@ -208,10 +246,30 @@ def fit_library(data, library):
     return image_t(image)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 fit_library.cuda_support = False
-fit_library.dask_support = False
+fit_library.dask_support = True
 fit_library.input_access = ("read",)
+
+
+def fit_library_python(values, measured):
+    weights = np.full((*values.shape[:2], measured.shape[1]), np.nan)
+    for act in range(values.shape[0]):
+        for alt in range(values.shape[1]):
+            spectrum = values[act, alt, :]
+            if np.isfinite(spectrum).all():
+                weights[act, alt, :] = nnls(measured, spectrum)[0]
+    return weights
+
+
+def fit_library_dask(values, measured):
+    values = da.asarray(values).rechunk({2: -1})
+    return values.map_blocks(
+        fit_library_python,
+        measured=measured,
+        chunks=(*values.chunks[:2], (measured.shape[1],)),
+        dtype=float,
+        meta=np.empty((0, 0, 0)),
+    )
 
 
 def reconstruct_library(data, library, target_nm):
@@ -231,7 +289,7 @@ def reconstruct_library(data, library, target_nm):
 
     # Interpolate the library once, then apply rho_m = sum_r c_r e_rm to every pixel.
     spectra = interp1d(source_nm, endmembers.values, axis=0)(target_nm)
-    reflectance = weights.values @ spectra.T
+    reflectance = weights.data @ spectra.T
 
     image = xr.DataArray(
         reflectance,
@@ -245,7 +303,6 @@ def reconstruct_library(data, library, target_nm):
     return image_t(image)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 reconstruct_library.cuda_support = False
-reconstruct_library.dask_support = False
+reconstruct_library.dask_support = True
 reconstruct_library.input_access = ("read",)

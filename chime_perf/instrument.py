@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
-from eopl import Pipeline, image_t
+from eopl import image_t
 
 from chime_perf.algorithms.acquisition_algorithms import (
     absolute_offset,
@@ -26,6 +26,7 @@ from chime_perf.algorithms.acquisition_algorithms import (
 from chime_perf.algorithms.instrument_algorithms import isrf_sigma, psf_kernel, psf_sigma_px
 from chime_perf.algorithms.ssgm_algorithms import validate_spatial_sampling
 from chime_perf.params import ChimeParams, boundary_settings
+from chime_perf.pipeline import ChimePipeline
 
 
 def instrument(
@@ -38,7 +39,7 @@ def instrument(
     parameters=None,
 ):
     """Simulate detector radiance and retain the atmosphere for reconstruction."""
-    pl = Pipeline(output_root=output_root)
+    pl = ChimePipeline(output_root=output_root)
 
     # 1. INITIALIZATION AND CONFIGURATION
     if config_path is not None:
@@ -55,17 +56,16 @@ def instrument(
     if data is None:
         if input_path is None:
             raise ValueError("Supply input_path or an in-memory image through data.")
-        with xr.open_dataset(input_path) as source:
-            data = image_t(source["radiance"].load())
-        pl.manifest["input"] = {"file": str(Path(input_path).resolve())}
+        data = pl.read_radiance(input_path)
+    data = pl.prepare_image(data)
 
     coefficient_path = atmosphere_path if atmosphere_path is not None else input_path
     if coefficient_path is None:
         raise ValueError("Supply the saved propagation product through atmosphere_path.")
-    with xr.open_dataset(coefficient_path) as source:
-        atmosphere = source.load()
-
     coefficient_names = ("path_radiance", "spherical_albedo", "transmission", "solar_scale")
+    with xr.open_dataset(coefficient_path) as source:
+        available = [name for name in coefficient_names if name in source]
+        atmosphere = source[available].load()
     if not all(name in atmosphere for name in coefficient_names):
         raise ValueError("The propagation product must contain the saved P, S, T and C.")
 

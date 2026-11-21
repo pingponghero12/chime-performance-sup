@@ -31,6 +31,11 @@ def average_atmosphere(data, response):
     return image_t(averaged)
 
 
+average_atmosphere.cuda_support = False
+average_atmosphere.dask_support = False
+average_atmosphere.input_access = ("read", "read")
+
+
 def toa_reflectance(data, solar_scale):
     """Divide measured radiance by the saved solar radiance scale C."""
     source = data.image()
@@ -42,6 +47,11 @@ def toa_reflectance(data, solar_scale):
     result = source.copy(data=result.transpose(*source.dims).data)
     result.attrs["units"] = "1"
     return image_t(result)
+
+
+toa_reflectance.cuda_support = False
+toa_reflectance.dask_support = True
+toa_reflectance.input_access = ("read", "read")
 
 
 def path_reflectance(data, solar_scale):
@@ -56,6 +66,11 @@ def path_reflectance(data, solar_scale):
     return image_t(result)
 
 
+path_reflectance.cuda_support = False
+path_reflectance.dask_support = True
+path_reflectance.input_access = ("read", "read")
+
+
 def remove_atmosphere(data, path, transmission):
     """Subtract path reflectance and divide by two-way transmission."""
     source = data.image()
@@ -66,6 +81,11 @@ def remove_atmosphere(data, path, transmission):
     result = (source - path.image()) / t.where(np.isfinite(t) & (t > 0))
     result = source.copy(data=result.transpose(*source.dims).data)
     return image_t(result)
+
+
+remove_atmosphere.cuda_support = False
+remove_atmosphere.dask_support = True
+remove_atmosphere.input_access = ("read", "read", "read")
 
 
 def surface_reflectance(data, spherical_albedo):
@@ -81,23 +101,6 @@ def surface_reflectance(data, spherical_albedo):
     return image_t(result)
 
 
-# EOPAL operation contracts: CPU NumPy/Xarray implementations; inputs are read-only.
-average_atmosphere.cuda_support = False
-average_atmosphere.dask_support = False
-average_atmosphere.input_access = ("read", "read")
-
-toa_reflectance.cuda_support = False
-toa_reflectance.dask_support = False
-toa_reflectance.input_access = ("read", "read")
-
-path_reflectance.cuda_support = False
-path_reflectance.dask_support = False
-path_reflectance.input_access = ("read", "read")
-
-remove_atmosphere.cuda_support = False
-remove_atmosphere.dask_support = False
-remove_atmosphere.input_access = ("read", "read", "read")
-
 surface_reflectance.cuda_support = False
-surface_reflectance.dask_support = False
+surface_reflectance.dask_support = True
 surface_reflectance.input_access = ("read", "read")

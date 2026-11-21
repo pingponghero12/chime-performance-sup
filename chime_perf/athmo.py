@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
-from eopl import Pipeline, image_t
+from eopl import image_t
 
 from chime_perf.algorithms.algorithms import reflectance_image
 from chime_perf.algorithms.athmo_algorithms import (
@@ -13,6 +13,7 @@ from chime_perf.algorithms.athmo_algorithms import (
     prepare_atmosphere,
     propagate,
 )
+from chime_perf.pipeline import ChimePipeline
 
 
 def athmo(
@@ -25,7 +26,7 @@ def athmo(
     save=True,
 ):
     """Apply the atmosphere; return the radiance image for the next module."""
-    pl = Pipeline(output_root=output_root)
+    pl = ChimePipeline(output_root=output_root)
 
     # 1. INITIALIZATION AND CONFIGURATION
     if config_path is not None:
@@ -41,7 +42,8 @@ def athmo(
     if data is None:
         if input_path is None:
             raise ValueError("Supply input_path or an in-memory image through data.")
-        data = pl.read_input(str(input_path), dask=False)
+        data = pl.read_input(input_path)
+    data = pl.prepare_image(data)
 
     reflectance = reflectance_image(data)
 

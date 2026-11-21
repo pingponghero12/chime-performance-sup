@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import xarray as xr
-from eopl import Pipeline, image_t
+from eopl import image_t
 
 from chime_perf.algorithms.algorithms import grid, reflectance_image
 from chime_perf.algorithms.ssgm_algorithms import (
@@ -13,6 +13,7 @@ from chime_perf.algorithms.ssgm_algorithms import (
     reconstruct_library,
     validate_spatial_sampling,
 )
+from chime_perf.pipeline import ChimePipeline
 
 
 def ssgm(
@@ -24,7 +25,7 @@ def ssgm(
     save=True,
 ):
     """Prepare a reflectance scene; return the image for the next module."""
-    pl = Pipeline(output_root=output_root)
+    pl = ChimePipeline(output_root=output_root)
 
     # 1. INITIALIZATION AND CONFIGURATION
     if config_path is not None:
@@ -40,7 +41,8 @@ def ssgm(
     if data is None:
         if input_path is None:
             raise ValueError("Supply input_path or an in-memory image through data.")
-        data = pl.read_input(str(input_path), dask=False)
+        data = pl.read_input(input_path)
+    data = pl.prepare_image(data)
 
     reflectance_image(data)
     settings = pl.local_config.get("scene", {})

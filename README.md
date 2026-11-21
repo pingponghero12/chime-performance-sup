@@ -141,6 +141,26 @@ Standalone modules save directly in `--output`.
 
 ### Input and configuration
 
+Select the processing backend in the same YAML file used with `--config`.
+
+```yaml
+run_options:
+  backend: dask              # python is the default.
+  precision: float32
+  num_cores: 4
+  dask_chunks: {ACT: 128, ALT: 128}
+```
+
+Dask keeps each spectrum together. Give both spatial axes to use tiles, or use
+`dask_chunks: {ALT: 128}` for strips. The instrument reads neighbouring pixels
+across tile boundaries for convolution and samples the same global detector grid.
+Dask uses local threads by default and can use an active `distributed.Client`.
+With separate worker processes, set `HDF5_USE_FILE_LOCKING=FALSE` before starting
+the client and workers if NetCDF writes hit competing file locks. Use shared
+paths for input and output, and give each run its own output directory.
+[Xarray's NetCDF notes](https://docs.xarray.dev/en/stable/user-guide/dask.html#reading-and-writing-data)
+`cpp` and `cuda` are reserved for the parallel C++ and GPU backends.
+
 Input is a NetCDF cube named `reflectance`, with dimensions `ACT`, `ALT`, `SPE`,
 coordinate units `m`, `m`, `nm` and reflectance units `1`.
 The `geometry` attribute distinguishes map and sensor grids.

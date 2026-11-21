@@ -153,9 +153,8 @@ def combine_transmission(gas, downward, upward):
     return image_t(transmission)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 combine_transmission.cuda_support = False
-combine_transmission.dask_support = False
+combine_transmission.dask_support = True
 combine_transmission.input_access = ("read", "read", "read")
 
 
@@ -171,9 +170,8 @@ def calculate_solar_scale(irradiance, solar_zenith_deg):
     return image_t(scale)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 calculate_solar_scale.cuda_support = False
-calculate_solar_scale.dask_support = False
+calculate_solar_scale.dask_support = True
 calculate_solar_scale.input_access = ("read",)
 
 
@@ -226,7 +224,6 @@ def propagate(data, atmosphere):
     return image_t(radiance)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 propagate.cuda_support = False
-propagate.dask_support = False
+propagate.dask_support = True
 propagate.input_access = ("read",)

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
-from eopl import Pipeline, image_t
+from eopl import image_t
 
 from chime_perf.algorithms.acquisition_algorithms import spectral_response
 from chime_perf.algorithms.instrument_algorithms import isrf_sigma
@@ -16,6 +16,7 @@ from chime_perf.algorithms.reconstruction_algorithms import (
     toa_reflectance,
 )
 from chime_perf.params import boundary_settings
+from chime_perf.pipeline import ChimePipeline
 
 
 def reconstruction(
@@ -27,7 +28,7 @@ def reconstruction(
     save=True,
 ):
     """Retrieve BOA reflectance without invoking an atmospheric solver."""
-    pl = Pipeline(output_root=output_root)
+    pl = ChimePipeline(output_root=output_root)
 
     # 1. INITIALIZATION AND CONFIGURATION
     if config_path is not None:
@@ -41,13 +42,15 @@ def reconstruction(
 
     boundaries = boundary_settings(pl.local_config)
     product = None
+    names = ("path_radiance", "spherical_albedo", "transmission", "solar_scale")
     if data is None:
         if input_path is None:
             raise ValueError("Supply input_path or an in-memory image through data.")
+        data = pl.read_radiance(input_path)
         with xr.open_dataset(input_path) as source:
-            product = source.load()
-        data = image_t(product["radiance"])
-        pl.manifest["input"] = {"file": str(Path(input_path).resolve())}
+            available = [name for name in (*names, "nominal_fwhm") if name in source]
+            product = source[available].load()
+    data = pl.prepare_image(data)
 
     image = data.image().transpose("ACT", "ALT", "SPE")
     if image.attrs.get("units") != "W m-2 sr-1 um-1":
@@ -63,11 +66,11 @@ def reconstruction(
         if coefficient_path is None:
             raise ValueError("Supply the saved propagation product through atmosphere_path.")
         with xr.open_dataset(coefficient_path) as source:
-            atmosphere = source.load()
+            available = [name for name in names if name in source]
+            atmosphere = source[available].load()
     else:
         atmosphere = product
 
-    names = ("path_radiance", "spherical_albedo", "transmission", "solar_scale")
     if not all(name in atmosphere for name in names):
         raise ValueError("Reconstruction requires the saved P, S, T and C quantities.")
     axis = "atmosphere_SPE" if "atmosphere_SPE" in atmosphere.dims else "SPE"

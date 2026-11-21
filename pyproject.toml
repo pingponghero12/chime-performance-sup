@@ -24,6 +24,7 @@ dependencies = [
 [project.optional-dependencies]
 pipeline = [
     "eopl>=0.2.1",
+    "dask[array]",
     "numba>=0.61",
     "Py6S>=1.9.2",
 ]
