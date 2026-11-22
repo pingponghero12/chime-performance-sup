@@ -297,7 +297,7 @@ def fit_library_dask(values, measured):
     )
 
 
-def reconstruct_library(data, library, target_nm):
+def reconstruct_library(data, library, target_nm, backend=None, threads=1):
     """Reconstruct rho(lambda) as the weighted sum of the library spectra."""
     weights = data.image()
     endmembers = library["reflectance"].transpose("library_SPE", "material")
@@ -314,7 +314,14 @@ def reconstruct_library(data, library, target_nm):
 
     # Interpolate the library once, then apply rho_m = sum_r c_r e_rm to every pixel.
     spectra = interp1d(source_nm, endmembers.values, axis=0)(target_nm)
-    reflectance = weights.data @ spectra.T
+    if select_backend(data, backend) == "cpp":
+        reflectance = native_module().reconstruct_library(
+            np.ascontiguousarray(weights.values, dtype=float),
+            np.ascontiguousarray(spectra.T, dtype=float),
+            threads,
+        )
+    else:
+        reflectance = weights.data @ spectra.T
 
     image = xr.DataArray(
         reflectance,

@@ -233,10 +233,43 @@ Array<double> fit_library(const Array<T>& values, const Array<double>& measured,
     return result;
 }
 
+Array<double> reconstruct_library(
+    const Array<double>& weights, const Array<double>& spectra, int threads
+) {
+    const auto mixture = weights.unchecked<3>();
+    const auto library = spectra.unchecked<2>();
+    const Index act = mixture.shape(0), alt = mixture.shape(1);
+    const Index materials = mixture.shape(2), bands = library.shape(1);
+    if (materials != library.shape(0)) {
+        throw std::invalid_argument("The weights and library must use the same materials.");
+    }
+    Array<double> result({act, alt, bands});
+    auto output = result.mutable_unchecked<3>();
+
+    py::gil_scoped_release release;
+    #pragma omp parallel for num_threads(threads) schedule(static)
+    for (Index pixel = 0; pixel < act * alt; ++pixel) {
+        const Index x = pixel / alt, y = pixel % alt;
+        auto* spectrum = output.mutable_data(x, y, 0);
+        std::fill_n(spectrum, bands, 0.0);
+        for (Index material = 0; material < materials; ++material) {
+            const double proportion = mixture(x, y, material);
+            const auto* endmember = library.data(material, 0);
+            #pragma omp simd
+            for (Index band = 0; band < bands; ++band) {
+                spectrum[band] += proportion * endmember[band];
+            }
+        }
+    }
+    return result;
+}
+
 }  // namespace
 
 void bind_nnls(py::module_& module) {
     using namespace py::literals;
+    module.def("reconstruct_library", &reconstruct_library, "weights"_a.noconvert(),
+               "library"_a.noconvert(), "threads"_a);
     module.def("fit_library", &fit_library<float>, "values"_a.noconvert(),
                "measured"_a.noconvert(), "threads"_a);
     module.def("fit_library", &fit_library<double>, "values"_a.noconvert(),

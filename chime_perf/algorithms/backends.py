@@ -38,14 +38,24 @@ def cpp_pixels(values):
 
 def cpp_spectral_formula(name, image, threads, *coefficients):
     """Pass aligned spectra and coefficients to an OpenMP pixel formula."""
-    dtype = np.result_type(image.dtype, *(coefficient.dtype for coefficient in coefficients))
+    types = [
+        value if np.isscalar(value) else np.asarray(value).dtype for value in coefficients
+    ]
+    dtype = np.result_type(image.dtype, *types)
     dtype = np.float32 if dtype == np.float32 else np.float64
     pixels = np.ascontiguousarray(image.transpose("ACT", "ALT", "SPE").values, dtype=dtype)
     vectors = [
-        np.ascontiguousarray(coefficient.values, dtype=dtype) for coefficient in coefficients
+        np.ascontiguousarray(
+            np.broadcast_to(np.asarray(coefficient), (image.sizes["SPE"],)), dtype=dtype
+        )
+        for coefficient in coefficients
     ]
     values = getattr(native_module(), name)(pixels, *vectors, threads)
-    return image.transpose("ACT", "ALT", "SPE").copy(data=values).transpose(*image.dims)
+    return (
+        image.transpose("ACT", "ALT", "SPE")
+        .copy(deep=False, data=values)
+        .transpose(*image.dims)
+    )
 
 
 def tiles(values, shape, make_tile, tile_sizes=None):

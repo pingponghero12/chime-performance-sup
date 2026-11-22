@@ -10,6 +10,7 @@ from scipy.interpolate import RegularGridInterpolator
 from chime_perf.algorithms.algorithms import require_units
 from chime_perf.algorithms.backends import (
     cpp_pixels,
+    cpp_spectral_formula,
     native_module,
     select_backend,
     tile_call,
@@ -460,17 +461,20 @@ def convolve_downsample_dask(values, kernel, act, alt, factor_act, factor_alt):
     return tiles(values, shape, make_tile, tile_sizes)
 
 
-def relative_radiance(data, lref):
+def relative_radiance(data, lref, backend=None, threads=1):
     """Express noise-free radiance as a fraction of the reference radiance."""
     source = data.image()
     require_units(source, "W m-2 sr-1 um-1")
-    # lref has one value per channel; it repeats across both spatial axes.
-    image = source.copy(data=(source / lref).data)
-    image.attrs["units"] = "1"
-    if data.is_dask:
-        image = image.copy(data=image.data.map_blocks(check_radiance, dtype=image.dtype))
+    if select_backend(data, backend) == "cpp":
+        image = cpp_spectral_formula("relative_radiance", source, threads, lref)
     else:
-        check_radiance(image.values)
+        # lref has one value per channel; it repeats across both spatial axes.
+        image = source.copy(data=(source / lref).data)
+        if data.is_dask:
+            image = image.copy(data=image.data.map_blocks(check_radiance, dtype=image.dtype))
+        else:
+            check_radiance(image.values)
+    image.attrs["units"] = "1"
     return image_t(image)
 
 
@@ -485,11 +489,14 @@ def check_radiance(values):
     return values
 
 
-def temporal_snr(data, g, n0):
+def temporal_snr(data, g, n0, backend=None, threads=1):
     """Calculate SNR = g r / sqrt(r + N0)."""
     r = data.image()
     require_units(r, "1")
-    result = r.copy(data=(g * r / np.sqrt(r + n0)).data)
+    if select_backend(data, backend) == "cpp":
+        result = cpp_spectral_formula("temporal_snr", r, threads, g, n0)
+    else:
+        result = r.copy(data=(g * r / np.sqrt(r + n0)).data)
     result.attrs["units"] = "1"
     return image_t(result)
 
@@ -499,11 +506,14 @@ temporal_snr.dask_support = True
 temporal_snr.input_access = ("read",)
 
 
-def temporal_sigma(data, lref, g, n0):
+def temporal_sigma(data, lref, g, n0, backend=None, threads=1):
     """Evaluate noise amplitude without dividing zero radiance by zero SNR."""
     r = data.image()
     require_units(r, "1")
-    result = r.copy(data=(lref / g * np.sqrt(r + n0)).data)
+    if select_backend(data, backend) == "cpp":
+        result = cpp_spectral_formula("temporal_sigma", r, threads, lref / g, n0)
+    else:
+        result = r.copy(data=(lref / g * np.sqrt(r + n0)).data)
     result.attrs["units"] = "W m-2 sr-1 um-1"
     return image_t(result)
 
@@ -513,9 +523,16 @@ temporal_sigma.dask_support = True
 temporal_sigma.input_access = ("read",)
 
 
-def draw_noise(data, rng, enabled=True):
+def draw_noise(data, rng, enabled=True, backend=None, threads=1):
     """Draw independent Gaussian errors in the supplied standard deviation's units."""
     sigma = data.image()
+    if select_backend(data, backend) == "cpp" and enabled:
+        # NumPy draws in the same order as Python. OpenMP applies the amplitudes.
+        arranged = sigma.transpose("ACT", "ALT", "SPE")
+        draws = xr.DataArray(rng.normal(size=sigma.shape), dims=sigma.dims)
+        draws = np.ascontiguousarray(draws.transpose(*arranged.dims).values)
+        values = native_module().scale_noise(cpp_pixels(arranged.values), draws, threads)
+        return image_t(arranged.copy(deep=False, data=values).transpose(*sigma.dims))
     if data.is_dask:
         if enabled:
             values = standard_noise_dask(rng, sigma.shape, sigma.chunks) * sigma.data
@@ -559,11 +576,14 @@ def standard_noise_dask(rng, shape, chunks):
     return da.concatenate(blocks).reshape(shape).rechunk(chunks)
 
 
-def electron_signal(data, a, b):
+def electron_signal(data, a, b, backend=None, threads=1):
     """Calculate the paper's equivalent electron signal n = a + b r."""
     r = data.image()
     require_units(r, "1")
-    result = r.copy(data=(a + b * r).data)
+    if select_backend(data, backend) == "cpp":
+        result = cpp_spectral_formula("electron_signal", r, threads, a, b)
+    else:
+        result = r.copy(data=(a + b * r).data)
     result.attrs["units"] = "electron"
     return image_t(result)
 
@@ -573,12 +593,26 @@ electron_signal.dask_support = True
 electron_signal.input_access = ("read",)
 
 
-def absolute_offset(data, electrons, lref, a, b, coefficient, s0):
+def absolute_offset(data, electrons, lref, a, b, coefficient, s0, backend=None, threads=1):
     """Calculate the additive ARA term, with the explicit zero-radiance limit."""
     signal = data.image()
     n = electrons.image()
     require_units(signal, "W m-2 sr-1 um-1")
     require_units(n, "electron")
+    if select_backend(data, backend) == "cpp":
+        source = signal.transpose("ACT", "ALT", "SPE")
+        dtype = np.result_type(source.dtype, n.dtype)
+        dtype = np.float32 if dtype == np.float32 else np.float64
+        bands = (source.sizes["SPE"],)
+        values = native_module().absolute_offset(
+            np.ascontiguousarray(source.values, dtype=dtype),
+            np.ascontiguousarray(n.transpose(*source.dims).values, dtype=dtype),
+            np.ascontiguousarray(np.broadcast_to(lref / b, bands), dtype=float),
+            np.ascontiguousarray(np.broadcast_to(np.asarray(a) == 0, bands)),
+            coefficient * s0,
+            threads,
+        )
+        return image_t(source.copy(deep=False, data=values).transpose(*signal.dims))
     if data.is_dask or electrons.is_dask:
         nonzero = n.data != 0
         ratio = da.where(nonzero, signal.data / da.where(nonzero, n.data, 1), 0)
@@ -597,9 +631,21 @@ absolute_offset.dask_support = True
 absolute_offset.input_access = ("read", "read")
 
 
-def apply_absolute_error(data, noise, offset, gain):
+def apply_absolute_error(data, noise, offset, gain, backend=None, threads=1):
     """Multiply only the signal by the ARA gain; retain the original noise draw."""
     source = data.image()
+    if select_backend(data, backend) == "cpp":
+        source, draws, bias = xr.align(
+            source, noise.image(), offset.image(), join="exact", copy=False
+        )
+        dtype = np.result_type(source.dtype, draws.dtype, bias.dtype, gain)
+        dtype = np.float32 if dtype == np.float32 else np.float64
+        pixels = np.ascontiguousarray(source.values, dtype=dtype)
+        draws = np.ascontiguousarray(draws.transpose(*source.dims).values, dtype=dtype)
+        bias = np.ascontiguousarray(bias.transpose(*source.dims).values, dtype=dtype)
+        values = native_module().apply_absolute_error(pixels, draws, bias, gain, threads)
+        return image_t(source.copy(deep=False, data=values))
+
     values = gain * source + noise.image() + offset.image()
     return image_t(source.copy(data=values.transpose(*source.dims).data))
 
@@ -631,9 +677,20 @@ striping_gains.dask_support = True
 striping_gains.input_access = ("read",)
 
 
-def apply_striping(data, gains):
+def apply_striping(data, gains, backend=None, threads=1):
     """Apply the saved column gain to every ALT pixel."""
     source = data.image()
+    if select_backend(data, backend) == "cpp":
+        arranged = source.transpose("ACT", "ALT", "SPE")
+        arranged, gain = xr.align(arranged, gains.image(), join="exact", copy=False)
+        dtype = np.result_type(arranged.dtype, gain.dtype)
+        dtype = np.float32 if dtype == np.float32 else np.float64
+        values = native_module().apply_striping(
+            np.ascontiguousarray(arranged.values, dtype=dtype),
+            np.ascontiguousarray(gain.transpose("ACT", "SPE").values, dtype=dtype),
+            threads,
+        )
+        return image_t(arranged.copy(deep=False, data=values).transpose(*source.dims))
     # Xarray matches ACT and SPE by name and repeats each gain along the missing ALT axis.
     values = (source * gains.image()).transpose(*source.dims)
     return image_t(source.copy(data=values.data))

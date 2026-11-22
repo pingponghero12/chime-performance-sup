@@ -9,11 +9,9 @@ image_t = pytest.importorskip("eopl").image_t
 pytest.importorskip("numba")
 pytest.importorskip("chime_perf._cpp")
 
-fit_library = pytest.importorskip("chime_perf.algorithms.ssgm_algorithms").fit_library
+ssgm = pytest.importorskip("chime_perf.algorithms.ssgm_algorithms")
 main = pytest.importorskip("chime_perf.run").main
-spectral_response = pytest.importorskip(
-    "chime_perf.algorithms.acquisition_algorithms"
-).spectral_response
+acquisition = pytest.importorskip("chime_perf.algorithms.acquisition_algorithms")
 
 
 def test_cpp_nnls_matches_python_with_missing_spectra():
@@ -34,15 +32,26 @@ def test_cpp_nnls_matches_python_with_missing_spectra():
     for axis, unit in (("ACT", "m"), ("ALT", "m"), ("SPE", "nm")):
         scene[axis].attrs["units"] = unit
     library = xr.Dataset(
-        {"measured": (("SPE", "material"), measured)},
-        coords={"SPE": wavelengths, "material": ["a", "b", "c", "d"]},
+        {
+            "measured": (("SPE", "material"), measured),
+            "reflectance": (("library_SPE", "material"), measured),
+        },
+        coords={
+            "SPE": wavelengths,
+            "library_SPE": wavelengths,
+            "material": ["a", "b", "c", "d"],
+        },
     )
 
-    expected = fit_library(image_t(scene), library).image()
-    actual = fit_library(image_t(scene), library, backend="cpp", threads=2).image()
+    expected = ssgm.fit_library(image_t(scene), library)
+    actual = ssgm.fit_library(image_t(scene), library, backend="cpp", threads=2)
 
-    xr.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-12)
-    np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+    xr.testing.assert_allclose(actual.image(), expected.image(), rtol=1e-11, atol=1e-12)
+    np.testing.assert_array_equal(np.isnan(actual.image()), np.isnan(expected.image()))
+    target = np.linspace(wavelengths[0], wavelengths[-1], 23)
+    expected_scene = ssgm.reconstruct_library(expected, library, target).image()
+    actual_scene = ssgm.reconstruct_library(actual, library, target, backend="cpp", threads=2)
+    xr.testing.assert_allclose(actual_scene.image(), expected_scene, rtol=1e-11, atol=1e-12)
 
 
 def test_cpp_spectral_response_accepts_widths_by_detector_column():
@@ -56,10 +65,24 @@ def test_cpp_spectral_response_accepts_widths_by_detector_column():
     wavelengths = np.arange(480.0, 505.0)
     widths = np.array([[2.0, 3.0], [3.0, 2.0]])
 
-    expected = spectral_response(centres, wavelengths, widths).image()
-    actual = spectral_response(centres, wavelengths, widths, backend="cpp", threads=2).image()
+    expected = acquisition.spectral_response(centres, wavelengths, widths).image()
+    actual = acquisition.spectral_response(
+        centres, wavelengths, widths, backend="cpp", threads=2
+    ).image()
 
     xr.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_cpp_noise_keeps_the_same_draws_and_rng_state():
+    sigma = image_t(
+        np.arange(24, dtype=np.float32).reshape(2, 3, 4), dims=("SPE", "ALT", "ACT")
+    )
+    python_rng, cpp_rng = np.random.default_rng(42), np.random.default_rng(42)
+    expected = acquisition.draw_noise(sigma, python_rng).image()
+    actual = acquisition.draw_noise(sigma, cpp_rng, backend="cpp", threads=2).image()
+
+    xr.testing.assert_identical(actual, expected)
+    assert cpp_rng.normal() == python_rng.normal()
 
 
 @pytest.mark.parametrize("precision", ["float32", "float64"])
