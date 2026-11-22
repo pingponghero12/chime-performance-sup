@@ -8,10 +8,18 @@ from eopl import image_t
 from scipy.interpolate import RegularGridInterpolator
 
 from chime_perf.algorithms.algorithms import require_units
-from chime_perf.algorithms.backends import select_backend, tile_call, tiles
+from chime_perf.algorithms.backends import (
+    cpp_pixels,
+    native_module,
+    select_backend,
+    tile_call,
+    tiles,
+)
 
 
-def spectral_response(centres, wavelength_nm, sigma_nm, support_sigma=3, backend=None):
+def spectral_response(
+    centres, wavelength_nm, sigma_nm, support_sigma=3, backend=None, threads=1
+):
     """Normalise Gaussian channel responses, repeating edge samples for missing tails."""
     wavelength_nm = np.asarray(wavelength_nm, dtype=float)
     if (
@@ -49,7 +57,8 @@ def spectral_response(centres, wavelength_nm, sigma_nm, support_sigma=3, backend
     )
 
     count = wavelength_nm.size
-    if select_backend(centres, backend) == "dask" and "detector_column" in centre.dims:
+    backend = select_backend(centres, backend)
+    if backend == "dask" and "detector_column" in centre.dims:
         # Each task builds a few detector columns using the same global padding.
         blocks = da.from_array(centre_values, chunks=(8, -1))
         weights = blocks.map_blocks(
@@ -63,6 +72,18 @@ def spectral_response(centres, wavelength_nm, sigma_nm, support_sigma=3, backend
             chunks=(*blocks.chunks, (count,)),
             dtype=float,
             meta=np.empty((0, 0, 0)),
+        )
+    elif backend == "cpp":
+        shape = centre_values.shape
+        weights = native_module().spectral_response(
+            np.ascontiguousarray(centre_values, dtype=float),
+            np.ascontiguousarray(np.broadcast_to(sigma_nm, shape), dtype=float).ravel(),
+            np.ascontiguousarray(np.broadcast_to(radius, shape), dtype=float).ravel(),
+            padded_nm,
+            np.gradient(padded_nm),
+            left,
+            count,
+            threads,
         )
     else:
         weights = spectral_response_python(
@@ -183,14 +204,24 @@ channel_centres.dask_support = True
 channel_centres.input_access = ("read",)
 
 
-def integrate_spectral(data, response, spacing_m, heading_deg, backend=None):
+def integrate_spectral(data, response, spacing_m, heading_deg, backend=None, threads=1):
     """Sum the input radiance with the response belonging to each detector column."""
     source = data.image().transpose("ACT", "ALT", "SPE")
     weights = response.image()
     if not np.array_equal(source.SPE.values, weights.sample_SPE.values):
         raise ValueError("Spectral response wavelengths must match the input image.")
-    if select_backend(data, backend) == "dask":
+    backend = select_backend(data, backend)
+    if backend == "dask":
         values = integrate_spectral_dask(source, weights, spacing_m, heading_deg)
+    elif backend == "cpp":
+        columns = column_coordinates(source, heading_deg, spacing_m)
+        values = native_module().integrate(
+            cpp_pixels(source.values),
+            np.ascontiguousarray(columns, dtype=np.intp),
+            np.ascontiguousarray(weights.values, dtype=float),
+            np.ascontiguousarray(weights.detector_column.values, dtype=np.intp),
+            threads,
+        )
     else:
         columns = column_coordinates(source, heading_deg, spacing_m)
         values = integrate_spectral_python(
@@ -250,7 +281,7 @@ def integrate_spectral_dask(source, weights, spacing_m, heading_deg):
     return tiles(pixels, shape, make_tile)
 
 
-def rotate_to_sensor(data, heading_deg, edge_mode="edge", backend=None):
+def rotate_to_sensor(data, heading_deg, edge_mode="edge", backend=None, threads=1):
     """Evaluate the map radiance at the rotated sensor-grid coordinates."""
     if edge_mode != "edge":
         raise ValueError("Only edge padding is supported.")
@@ -276,7 +307,17 @@ def rotate_to_sensor(data, heading_deg, edge_mode="edge", backend=None):
         else:
             lookup_x = np.clip(x, act[0], act[-1])
             lookup_y = np.clip(y, alt[0], alt[-1])
-            values = rotate_to_sensor_python(source.values, act, alt, lookup_x, lookup_y)
+            if backend == "cpp":
+                values = native_module().rotate(
+                    cpp_pixels(source.values),
+                    np.ascontiguousarray(act, dtype=float),
+                    np.ascontiguousarray(alt, dtype=float),
+                    lookup_x,
+                    lookup_y,
+                    threads,
+                )
+            else:
+                values = rotate_to_sensor_python(source.values, act, alt, lookup_x, lookup_y)
             result = source.copy(data=values)
 
     # These coordinates retain the original map position of every output centre.
@@ -323,7 +364,9 @@ def rotate_to_sensor_dask(values, act, alt, rotation):
     return tiles(values, values.shape, make_tile)
 
 
-def convolve_downsample(data, kernel, factor_act, factor_alt, edge_mode="edge", backend=None):
+def convolve_downsample(
+    data, kernel, factor_act, factor_alt, edge_mode="edge", backend=None, threads=1
+):
     """Evaluate spatial convolution only at the nominal centres that will be kept."""
     source = data.image()
     kernel = np.asarray(kernel, dtype=float)
@@ -338,9 +381,18 @@ def convolve_downsample(data, kernel, factor_act, factor_alt, edge_mode="edge", 
 
     act = np.arange(0, source.sizes["ACT"], factor_act)
     alt = np.arange(0, source.sizes["ALT"], factor_alt)
-    if select_backend(data, backend) == "dask":
+    backend = select_backend(data, backend)
+    if backend == "dask":
         values = convolve_downsample_dask(
             source.data, kernel, act, alt, factor_act, factor_alt
+        )
+    elif backend == "cpp":
+        values = native_module().convolve_downsample(
+            cpp_pixels(source.values),
+            np.ascontiguousarray(kernel),
+            factor_act,
+            factor_alt,
+            threads,
         )
     else:
         radius_act, radius_alt = np.array(kernel.shape) // 2

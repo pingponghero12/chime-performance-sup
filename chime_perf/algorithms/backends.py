@@ -1,13 +1,14 @@
 """Backend selection and a shared helper for independent spatial tiles."""
 
 import dask.array as da
+import numpy as np
 from dask import delayed
 
 
 def validate_backend(backend):
-    if backend in ("python", "dask"):
+    if backend in ("python", "dask", "cpp"):
         return backend
-    if backend in ("cpp", "cuda"):
+    if backend == "cuda":
         raise NotImplementedError(f"The CHIME {backend!r} backend is not implemented yet.")
     raise ValueError("backend must be python, dask, cpp, or cuda.")
 
@@ -16,6 +17,35 @@ def select_backend(data, backend):
     if backend is None:
         backend = "dask" if data.is_dask else "python"
     return validate_backend(backend)
+
+
+def native_module():
+    """Load the optional extension only when the C++ backend is selected."""
+    try:
+        from chime_perf import _cpp
+    except ImportError as error:
+        raise RuntimeError(
+            "Build CHIME with OpenMP first: pip install -e '.[pipeline]' -Cwheel.cmake=true"
+        ) from error
+    return _cpp
+
+
+def cpp_pixels(values):
+    """Keep the reference input precision without copying contiguous float cubes."""
+    dtype = np.float32 if values.dtype == np.float32 else np.float64
+    return np.ascontiguousarray(values, dtype=dtype)
+
+
+def cpp_spectral_formula(name, image, threads, *coefficients):
+    """Pass aligned spectra and coefficients to an OpenMP pixel formula."""
+    dtype = np.result_type(image.dtype, *(coefficient.dtype for coefficient in coefficients))
+    dtype = np.float32 if dtype == np.float32 else np.float64
+    pixels = np.ascontiguousarray(image.transpose("ACT", "ALT", "SPE").values, dtype=dtype)
+    vectors = [
+        np.ascontiguousarray(coefficient.values, dtype=dtype) for coefficient in coefficients
+    ]
+    values = getattr(native_module(), name)(pixels, *vectors, threads)
+    return image.transpose("ACT", "ALT", "SPE").copy(data=values).transpose(*image.dims)
 
 
 def tiles(values, shape, make_tile, tile_sizes=None):

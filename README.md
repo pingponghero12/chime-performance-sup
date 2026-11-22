@@ -159,7 +159,9 @@ With separate worker processes, set `HDF5_USE_FILE_LOCKING=FALSE` before startin
 the client and workers if NetCDF writes hit competing file locks. Use shared
 paths for input and output, and give each run its own output directory.
 [Xarray's NetCDF notes](https://docs.xarray.dev/en/stable/user-guide/dask.html#reading-and-writing-data)
-`cpp` and `cuda` are reserved for the parallel C++ and GPU backends.
+Use `backend: cpp` and set `num_cores` for OpenMP. Build the optional extension
+with `python -m pip install -e '.[pipeline]' -Cwheel.cmake=true` using a C++17
+compiler and an OpenMP runtime. `cuda` is reserved for the GPU backend.
 
 Input is a NetCDF cube named `reflectance`, with dimensions `ACT`, `ALT`, `SPE`,
 coordinate units `m`, `m`, `nm` and reflectance units `1`.

@@ -2,18 +2,24 @@
 
 import inspect
 import time
+from numbers import Integral
 from pathlib import Path
 
 import dask
 import xarray as xr
 from eopl import Pipeline, image_t
 
-from chime_perf.algorithms.backends import validate_backend
+from chime_perf.algorithms.backends import native_module, validate_backend
 
 
 class ChimePipeline(Pipeline):
     def set_run_options(self, *, backend="python", dask_chunks=None, **options):
         self.backend = validate_backend(backend)
+        if self.backend == "cpp":
+            threads = options.get("num_cores", 1)
+            if isinstance(threads, bool) or not isinstance(threads, Integral) or threads < 1:
+                raise ValueError("num_cores must be a positive integer for OpenMP.")
+            native_module()
         if dask_chunks is None:
             dask_chunks = {"ACT": 128, "ALT": 128}
         if (
@@ -52,12 +58,12 @@ class ChimePipeline(Pipeline):
                 return image_t(image.chunk(chunks))
             if "SPE" in image.dims and len(image.chunks[image.get_axis_num("SPE")]) > 1:
                 return image_t(image.chunk({"SPE": -1}))
-        if self.backend == "python" and data.is_dask:
+        if self.backend != "dask" and data.is_dask:
             return image_t(data.image().compute())
         return data
 
     def read_input(self, path):
-        if self.backend == "python" or self._is_skipping:
+        if self.backend != "dask" or self._is_skipping:
             return super().read_input(str(path), dask=False)
 
         self.manifest["input"] = {"file": str(Path(path).resolve())}
@@ -72,15 +78,18 @@ class ChimePipeline(Pipeline):
         """Read the image separately because the saved coefficients use another grid."""
         with self.open_product(path) as source:
             image = source["radiance"]
-            if self.backend == "python":
+            if self.backend != "dask":
                 image = image.load()
         self.manifest["input"] = {"file": str(Path(path).resolve())}
         return image_t(image)
 
     def run_operation(self, data, func, args=None):
         args = dict(args or {})
-        if "backend" in inspect.signature(func).parameters:
+        parameters = inspect.signature(func).parameters
+        if "backend" in parameters:
             args["backend"] = self.backend
+        if "threads" in parameters:
+            args["threads"] = self.run_options.num_cores
         return super().run_operation(
             data,
             func,

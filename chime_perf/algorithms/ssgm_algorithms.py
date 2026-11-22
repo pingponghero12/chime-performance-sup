@@ -9,7 +9,7 @@ from scipy.interpolate import interp1d
 from scipy.optimize import nnls
 
 from .algorithms import grid, reflectance_image
-from .backends import select_backend, tile_call, tiles
+from .backends import cpp_pixels, native_module, select_backend, tile_call, tiles
 
 
 def spatial_grid(coordinates, detector_spacing_m, oversampling="auto"):
@@ -87,7 +87,9 @@ def interpolate_spatial_axis(values, source_m, target_m, axis):
     return result
 
 
-def interpolate_spatial(data, detector_spacing_m=30.0, oversampling="auto", backend=None):
+def interpolate_spatial(
+    data, detector_spacing_m=30.0, oversampling="auto", backend=None, threads=1
+):
     """Interpolate ACT and ALT onto grids with integer spatial oversampling."""
     backend = select_backend(data, backend)
     source = data.image().transpose("ACT", "ALT", "SPE")
@@ -110,11 +112,19 @@ def interpolate_spatial(data, detector_spacing_m=30.0, oversampling="auto", back
 
         if backend == "dask":
             values = interpolate_spatial_dask(result.data, original, target, axis)
+        elif backend == "cpp":
+            values = native_module().interpolate_spatial(
+                cpp_pixels(result.values),
+                np.ascontiguousarray(original, dtype=float),
+                np.ascontiguousarray(target),
+                axis,
+                threads,
+            )
         else:
             values = interpolate_spatial_axis(result.values, original, target, axis)
 
         # Xarray handles coordinate attributes and auxiliary coordinates only;
-        # Numba applies the image equation into one preallocated output array.
+        # The selected kernel fills the new pixel array.
         coordinates = result.coords.to_dataset().interp({dimension: target}).coords
         result = xr.DataArray(
             values,
@@ -170,15 +180,23 @@ def interpolate_spectra(spectra, wavelength_nm, target_nm):
     return result
 
 
-def interpolate_spectral(data, step_nm=None, backend=None):
+def interpolate_spectral(data, step_nm=None, backend=None, threads=1):
     """Interpolate each pixel spectrum onto the requested SPE grid."""
     source = data.image().transpose("ACT", "ALT", "SPE")
 
     source_nm = grid(source.SPE.values)
     target_nm = grid(source_nm, step_nm)
 
-    if select_backend(data, backend) == "dask":
+    backend = select_backend(data, backend)
+    if backend == "dask":
         result = interpolate_spectral_dask(source.data, source_nm, target_nm)
+    elif backend == "cpp":
+        result = native_module().interpolate_spectral(
+            cpp_pixels(source.values),
+            np.ascontiguousarray(source_nm),
+            np.ascontiguousarray(target_nm),
+            threads,
+        )
     else:
         result = interpolate_spectral_python(source.values, source_nm, target_nm)
 
@@ -218,7 +236,7 @@ def interpolate_spectral_dask(values, source_nm, target_nm):
     )
 
 
-def fit_library(data, library, backend=None):
+def fit_library(data, library, backend=None, threads=1):
     """Fit non-negative library weights independently at each spatial pixel."""
     reflectance = reflectance_image(data)
     measured = library["measured"].transpose("SPE", "material")
@@ -230,8 +248,15 @@ def fit_library(data, library, backend=None):
     if not np.isfinite(measured.values).all():
         raise ValueError("Measured-band library values must be finite.")
 
-    if select_backend(data, backend) == "dask":
+    backend = select_backend(data, backend)
+    if backend == "dask":
         weights = fit_library_dask(reflectance.data, measured.values)
+    elif backend == "cpp":
+        weights = native_module().fit_library(
+            cpp_pixels(reflectance.values),
+            np.ascontiguousarray(measured.values, dtype=float),
+            threads,
+        )
     else:
         weights = fit_library_python(reflectance.values, measured.values)
 

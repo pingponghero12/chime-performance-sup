@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.18)
+project(chime_cpp LANGUAGES CXX)
+
+find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(pybind11 CONFIG REQUIRED)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+pybind11_add_module(_cpp native/bindings.cpp native/sampling.cpp native/nnls.cpp native/radiometry.cpp)
+target_compile_features(_cpp PRIVATE cxx_std_17)
+target_link_libraries(_cpp PRIVATE OpenMP::OpenMP_CXX)
+if(MSVC)
+  target_compile_options(_cpp PRIVATE /fp:precise)
+else()
+  target_compile_options(_cpp PRIVATE -ffp-contract=off)
+endif()
+install(TARGETS _cpp DESTINATION chime_perf)

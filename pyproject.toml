@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.11", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "chime-perf"
@@ -42,12 +42,11 @@ Repository = "https://github.com/esa/chime-performance-sup"
 Issues = "https://github.com/esa/chime-performance-sup/issues"
 Paper = "https://spie.org/spie-sensors-imaging/presentation/CHIME-system-performance-at-critical-design-review--a-parametric/14279-7"
 
-[tool.setuptools]
-packages = ["chime_perf", "chime_perf.algorithms"]
-include-package-data = false
-
-[tool.setuptools.package-data]
-chime_perf = ["data/*.csv", "data/*.yml", "data/*.txt"]
+[tool.scikit-build]
+wheel.packages = ["chime_perf"]
+wheel.cmake = false
+sdist.include = ["CMakeLists.txt", "native/**"]
+sdist.exclude = [".local-tools/**", "demo-input/**", "outputs/**", "**/*.so"]
 
 [tool.ruff]
 line-length = 95
