@@ -1,21 +1,25 @@
-"""Check the optional OpenMP backend against the Python reference."""
+"""Check CPU backends against the Python reference using EOPL."""
 
 import numpy as np
 import pytest
 import yaml
 
+dask = pytest.importorskip("dask")
 xr = pytest.importorskip("xarray")
 image_t = pytest.importorskip("eopl").image_t
+operation_compare_test = pytest.importorskip("eopl.validation").operation_compare_test
 pytest.importorskip("numba")
-pytest.importorskip("chime_perf._cpp")
 
 ssgm = pytest.importorskip("chime_perf.algorithms.ssgm_algorithms")
 main = pytest.importorskip("chime_perf.run").main
 acquisition = pytest.importorskip("chime_perf.algorithms.acquisition_algorithms")
 
 
-def test_cpp_nnls_matches_python_with_missing_spectra():
+@pytest.mark.parametrize("backend", ["cpp", "dask"])
+def test_nnls_matches_python_with_missing_spectra(backend):
     """Fit mixtures, reject missing spectra and keep the material coordinates."""
+    if backend == "cpp":
+        pytest.importorskip("chime_perf._cpp")
     rng = np.random.default_rng(2)
     measured = rng.uniform(0.05, 0.8, (12, 4))
     mixtures = rng.uniform(0, 0.5, (6, 7, 4))
@@ -43,18 +47,36 @@ def test_cpp_nnls_matches_python_with_missing_spectra():
         },
     )
 
-    expected = ssgm.fit_library(image_t(scene), library)
-    actual = ssgm.fit_library(image_t(scene), library, backend="cpp", threads=2)
+    def fit(data, library, backend):
+        if backend == "dask":
+            data = data.chunk({"ACT": 3, "ALT": 4})
+        return ssgm.fit_library(image_t(data), library, backend=backend, threads=2)
 
-    xr.testing.assert_allclose(actual.image(), expected.image(), rtol=1e-11, atol=1e-12)
-    np.testing.assert_array_equal(np.isnan(actual.image()), np.isnan(expected.image()))
+    assert operation_compare_test(
+        fit, fit, scene, library,
+        kwargs={"backend": backend}, reference_kwargs={"backend": "python"},
+        rtol=1e-11, atol=1e-12,
+    )
+
+    weights = fit(scene, library, "python").image()
     target = np.linspace(wavelengths[0], wavelengths[-1], 23)
-    expected_scene = ssgm.reconstruct_library(expected, library, target).image()
-    actual_scene = ssgm.reconstruct_library(actual, library, target, backend="cpp", threads=2)
-    xr.testing.assert_allclose(actual_scene.image(), expected_scene, rtol=1e-11, atol=1e-12)
+
+    def reconstruct(data, library, target, backend):
+        if backend == "dask":
+            data = data.chunk({"ACT": 3, "ALT": 4})
+        return ssgm.reconstruct_library(
+            image_t(data), library, target, backend=backend, threads=2,
+        )
+
+    assert operation_compare_test(
+        reconstruct, reconstruct, weights, library, target,
+        kwargs={"backend": backend}, reference_kwargs={"backend": "python"},
+        rtol=1e-11, atol=1e-12,
+    )
 
 
 def test_cpp_spectral_response_accepts_widths_by_detector_column():
+    pytest.importorskip("chime_perf._cpp")
     centres = image_t(
         xr.DataArray(
             [[480.0, 504.0], [481.0, 503.0]],
@@ -65,29 +87,57 @@ def test_cpp_spectral_response_accepts_widths_by_detector_column():
     wavelengths = np.arange(480.0, 505.0)
     widths = np.array([[2.0, 3.0], [3.0, 2.0]])
 
-    expected = acquisition.spectral_response(centres, wavelengths, widths).image()
-    actual = acquisition.spectral_response(
-        centres, wavelengths, widths, backend="cpp", threads=2
-    ).image()
-
-    xr.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    assert operation_compare_test(
+        acquisition.spectral_response, acquisition.spectral_response,
+        centres, wavelengths, widths,
+        kwargs={"backend": "cpp", "threads": 2}, reference_kwargs={"backend": "python"},
+        rtol=1e-12, atol=1e-12,
+    )
 
 
 def test_cpp_noise_keeps_the_same_draws_and_rng_state():
+    pytest.importorskip("chime_perf._cpp")
     sigma = image_t(
         np.arange(24, dtype=np.float32).reshape(2, 3, 4), dims=("SPE", "ALT", "ACT")
     )
-    python_rng, cpp_rng = np.random.default_rng(42), np.random.default_rng(42)
-    expected = acquisition.draw_noise(sigma, python_rng).image()
-    actual = acquisition.draw_noise(sigma, cpp_rng, backend="cpp", threads=2).image()
+    def noise_and_next_draw(data, rng, backend):
+        noise = acquisition.draw_noise(data, rng, backend=backend, threads=2)
+        return noise, rng.normal()
 
-    xr.testing.assert_identical(actual, expected)
-    assert cpp_rng.normal() == python_rng.normal()
+    assert operation_compare_test(
+        noise_and_next_draw, noise_and_next_draw, sigma, np.random.default_rng(42),
+        kwargs={"backend": "cpp"}, reference_kwargs={"backend": "python"},
+        rtol=0, atol=0,
+    )
+
+
+@pytest.mark.parametrize("chunks", [{"ACT": 4}, {"ALT": 6}, {"ACT": 4, "ALT": 6}])
+def test_dask_convolution_matches_python_across_chunk_edges(chunks):
+    """Detector centres on chunk seams still use samples from neighbouring chunks."""
+    values = np.random.default_rng(42).uniform(1, 10, (11, 13, 3))
+    values[4, 6, 1] = np.nan
+    image = xr.DataArray(values, dims=("ACT", "ALT", "SPE"))
+    kernel = np.arange(1.0, 10).reshape(3, 3) / 45
+
+    def sample(data, backend):
+        if backend == "dask":
+            data = data.chunk(chunks)
+        result = acquisition.convolve_downsample(image_t(data), kernel, 2, 3, backend=backend)
+        assert result.is_dask == (backend == "dask")
+        return result
+
+    assert operation_compare_test(
+        sample, sample, image, kwargs={"backend": "dask"},
+        reference_kwargs={"backend": "python"}, rtol=0, atol=0,
+    )
 
 
 @pytest.mark.parametrize("precision", ["float32", "float64"])
-def test_cpp_full_chain_matches_python(tmp_path, precision):
+@pytest.mark.parametrize("backend", ["cpp", "dask"])
+def test_full_chain_matches_python(tmp_path, precision, backend):
     """Compare all four saved products on a rotated scene with noise and missing pixels."""
+    if backend == "cpp":
+        pytest.importorskip("chime_perf._cpp")
     rng = np.random.default_rng(42)
     input_wavelengths = np.arange(480.0, 623.0, 2)
     wavelengths = np.arange(480.0, 623.0)
@@ -123,7 +173,11 @@ def test_cpp_full_chain_matches_python(tmp_path, precision):
     atmosphere.to_netcdf(atmosphere_file)
 
     config = {
-        "run_options": {"precision": precision, "num_cores": 2},
+        "run_options": {
+            "precision": precision,
+            "num_cores": 2,
+            "dask_chunks": {"ACT": 8, "ALT": 9},
+        },
         "scene": {"spatial_interpolation": True, "spectral_step_nm": 1.0},
         "instrument": {
             "heading_deg": 17.0,
@@ -135,24 +189,26 @@ def test_cpp_full_chain_matches_python(tmp_path, precision):
         "breakpoints": True,
     }
 
-    for backend in ("python", "cpp"):
-        config["run_options"]["backend"] = backend
-        settings_file = tmp_path / f"{backend}.yml"
+    for selected in ("python", backend):
+        config["run_options"]["backend"] = selected
+        settings_file = tmp_path / f"{selected}.yml"
         settings_file.write_text(yaml.safe_dump(config))
-        main(
-            [
-                "--all",
-                "--input",
-                str(input_file),
-                "--atmosphere",
-                str(atmosphere_file),
-                "--config",
-                str(settings_file),
-                "--output",
-                str(tmp_path / backend),
-                "--save-intermediates",
-            ]
-        )
+        # Execute the Dask graph without concurrent NetCDF access in this numerical test.
+        with dask.config.set(scheduler="synchronous"):
+            main(
+                [
+                    "--all",
+                    "--input",
+                    str(input_file),
+                    "--atmosphere",
+                    str(atmosphere_file),
+                    "--config",
+                    str(settings_file),
+                    "--output",
+                    str(tmp_path / selected),
+                    "--save-intermediates",
+                ]
+            )
 
     tolerance = 1e-6 if precision == "float32" else 1e-12
     for name in (
@@ -165,14 +221,13 @@ def test_cpp_full_chain_matches_python(tmp_path, precision):
     ):
         with (
             xr.open_dataset(tmp_path / "python" / name) as expected,
-            xr.open_dataset(tmp_path / "cpp" / name) as actual,
+            xr.open_dataset(tmp_path / backend / name) as actual,
         ):
-            xr.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+            assert operation_compare_test(
+                actual.load, expected.load, rtol=tolerance, atol=tolerance,
+            ), f"{backend} differs from Python in {name}"
             xr.testing.assert_identical(
                 actual.coords.to_dataset(), expected.coords.to_dataset()
             )
             for variable in expected.data_vars:
                 assert actual[variable].attrs == expected[variable].attrs
-                np.testing.assert_array_equal(
-                    np.isnan(actual[variable]), np.isnan(expected[variable])
-                )
