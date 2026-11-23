@@ -15,6 +15,27 @@ main = pytest.importorskip("chime_perf.run").main
 acquisition = pytest.importorskip("chime_perf.algorithms.acquisition_algorithms")
 
 
+@pytest.mark.parametrize("input_dtype", [np.float32, np.float64])
+def test_cpp_spectral_interpolation_writes_requested_precision(input_dtype):
+    """Round on write while preserving exact nodes, clamped edges and missing bands."""
+    native = pytest.importorskip("chime_perf._cpp")
+    source = np.array([410.0, 415.0, 421.0, 430.0])
+    target = np.array([400.0, 410.0, 412.8, 415.0, 416.2, 421.0, 423.8, 430.0, 440.0])
+    pixels = np.array(
+        [[[.1, .25, .4, .7], [.15, np.nan, .3, .8], [.2, np.inf, np.inf, .9]]],
+        dtype=input_dtype,
+    )
+    reference = np.array([[np.interp(target, source, spectrum) for spectrum in pixels[0]]])
+
+    full = native.interpolate_spectral(pixels, source, target, 2)
+    rounded = native.interpolate_spectral(pixels, source, target, 2, output_float32=True)
+
+    assert full.dtype == np.float64
+    assert rounded.dtype == np.float32
+    np.testing.assert_array_equal(full, reference)
+    np.testing.assert_array_equal(rounded, reference.astype(np.float32))
+
+
 @pytest.mark.parametrize("backend", ["cpp", "dask"])
 def test_nnls_matches_python_with_missing_spectra(backend):
     """Fit mixtures, reject missing spectra and keep the material coordinates."""

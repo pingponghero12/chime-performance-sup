@@ -180,7 +180,7 @@ def interpolate_spectra(spectra, wavelength_nm, target_nm):
     return result
 
 
-def interpolate_spectral(data, step_nm=None, backend=None, threads=1):
+def interpolate_spectral(data, step_nm=None, backend=None, threads=1, run_options=None):
     """Interpolate each pixel spectrum onto the requested SPE grid."""
     source = data.image().transpose("ACT", "ALT", "SPE")
 
@@ -191,11 +191,14 @@ def interpolate_spectral(data, step_nm=None, backend=None, threads=1):
     if backend == "dask":
         result = interpolate_spectral_dask(source.data, source_nm, target_nm)
     elif backend == "cpp":
+        # Round on write for float32 runs to avoid a second full output cube.
+        output_float32 = run_options is not None and run_options.precision == "float32"
         result = native_module().interpolate_spectral(
             cpp_pixels(source.values),
             np.ascontiguousarray(source_nm),
             np.ascontiguousarray(target_nm),
             threads,
+            output_float32=output_float32,
         )
     else:
         result = interpolate_spectral_python(source.values, source_nm, target_nm)

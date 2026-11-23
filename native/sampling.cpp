@@ -75,8 +75,15 @@ Array<double> interpolate_spatial(
     return result;
 }
 
-template <class T>
-Array<double> interpolate_spectral(
+struct SpectralSample {
+    Index lower;
+    double spacing;
+    double distance_from_lower;
+    double distance_from_upper;
+};
+
+template <class T, class Output>
+Array<Output> interpolate_spectral_pixels(
     const Array<T>& values, const Array<double>& source, const Array<double>& target,
     int threads
 ) {
@@ -87,13 +94,24 @@ Array<double> interpolate_spectral(
     }
     const auto nx = input.shape(0), ny = input.shape(1);
     const auto count = target.size();
-    Array<double> result({nx, ny, count});
-    auto output = result.mutable_unchecked<3>();
+    Array<Output> result({nx, ny, count});
+    auto output = result.template mutable_unchecked<3>();
     const auto src = source.unchecked<1>();
     const auto dst = target.unchecked<1>();
-    std::vector<Index> lower(count);
+    std::vector<SpectralSample> samples;
+    samples.reserve(count);
     for (Index i = 0; i < count; ++i) {
-        lower[i] = right_interval(source, dst(i));
+        const double wavelength = dst(i);
+        const Index lower = right_interval(source, wavelength);
+        const double first = src(lower), second = src(lower + 1);
+        // A zero distance selects a source band directly, including at the edges.
+        if (wavelength <= first) {
+            samples.push_back({lower, 0, 0, 0});
+        } else if (wavelength >= second) {
+            samples.push_back({lower + 1, 0, 0, 0});
+        } else {
+            samples.push_back({lower, second - first, wavelength - first, wavelength - second});
+        }
     }
 
     py::gil_scoped_release release;
@@ -101,26 +119,35 @@ Array<double> interpolate_spectral(
     for (Index pixel = 0; pixel < nx * ny; ++pixel) {
         const Index x = pixel / ny, y = pixel % ny;
         for (Index i = 0; i < count; ++i) {
-            const Index j = lower[i];
-            const double first = input(x, y, j), second = input(x, y, j + 1);
-            if (dst(i) <= src(j)) {
-                output(x, y, i) = first;
-            } else if (dst(i) >= src(j + 1)) {
-                output(x, y, i) = second;
-            } else {
-                const double slope = (second - first) / (src(j + 1) - src(j));
-                double value = first + slope * (dst(i) - src(j));
+            const auto& sample = samples[i];
+            const double first = input(x, y, sample.lower);
+            double value = first;
+            if (sample.distance_from_lower != 0) {
+                const double second = input(x, y, sample.lower + 1);
+                const double slope = (second - first) / sample.spacing;
+                value = first + slope * sample.distance_from_lower;
                 if (std::isnan(value)) {
-                    value = second + slope * (dst(i) - src(j + 1));
+                    value = second + slope * sample.distance_from_upper;
                     if (std::isnan(value) && first == second) {
                         value = first;
                     }
                 }
-                output(x, y, i) = value;
             }
+            output(x, y, i) = static_cast<Output>(value);
         }
     }
     return result;
+}
+
+template <class T>
+py::array interpolate_spectral(
+    const Array<T>& values, const Array<double>& source, const Array<double>& target,
+    int threads, bool output_float32
+) {
+    if (output_float32) {
+        return interpolate_spectral_pixels<T, float>(values, source, target, threads);
+    }
+    return interpolate_spectral_pixels<T, double>(values, source, target, threads);
 }
 
 template <class T>
@@ -341,7 +368,8 @@ void bind_precision(py::module_& module) {
     module.def("interpolate_spatial", &interpolate_spatial<T>, "values"_a.noconvert(),
                "source"_a.noconvert(), "target"_a.noconvert(), "axis"_a, "threads"_a);
     module.def("interpolate_spectral", &interpolate_spectral<T>, "values"_a.noconvert(),
-               "source"_a.noconvert(), "target"_a.noconvert(), "threads"_a);
+               "source"_a.noconvert(), "target"_a.noconvert(), "threads"_a,
+               "output_float32"_a = false);
     module.def("rotate", &rotate<T>, "values"_a.noconvert(), "act"_a.noconvert(),
                "alt"_a.noconvert(), "lookup_x"_a.noconvert(), "lookup_y"_a.noconvert(), "threads"_a);
     module.def("integrate", &integrate<T>, "values"_a.noconvert(), "columns"_a.noconvert(),
