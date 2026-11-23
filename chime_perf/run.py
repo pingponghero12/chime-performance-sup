@@ -93,32 +93,37 @@ def main(argv=None):
         if args.save_intermediates:
             scene = None
 
-        radiance = athmo(
+        propagated = athmo(
             input_path=args.output / "ssgm" / "scene.nc",
             output_root=args.output / "athmo",
             config_path=args.config,
             atmosphere_path=args.atmosphere,
             sixs_path=args.sixs_path,
             data=scene,
+            save=args.save_intermediates,
+            return_atmosphere=not args.save_intermediates,
         )
+        del scene
+        radiance, atmosphere = (None, None) if args.save_intermediates else propagated
+        del propagated
 
-        # Propagation always archives its coefficients, including with in-memory handoff.
+        # Pass the same coefficients alongside the image when the handoff is in memory.
         detector = instrument(
             input_path=args.output / "athmo" / "toa.nc",
             output_root=args.output / "instrument",
             config_path=args.config,
-            data=None if args.save_intermediates else radiance,
+            data=radiance,
             save=args.save_intermediates,
+            atmosphere=atmosphere,
         )
+        del radiance
 
         reconstruction(
             input_path=args.output / "instrument" / "instrument.nc",
             output_root=args.output / "reconstruction",
             config_path=args.config,
             data=None if args.save_intermediates else detector,
-            atmosphere_path=None
-            if args.save_intermediates
-            else args.output / "athmo" / "toa.nc",
+            atmosphere=atmosphere,
         )
 
 

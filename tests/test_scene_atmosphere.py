@@ -249,14 +249,16 @@ def test_all_matches_standalone_modules(tmp_path, reflectance, atmosphere, disk_
 
     main(arguments)
 
-    with xr.open_dataset(output / "athmo" / "toa.nc") as saved:
-        np.testing.assert_allclose(saved.radiance, propagate(reflectance, atmosphere).image())
-        assert saved.transmission.attrs["units"] == "1"
-        assert bool(saved.valid.all())
-
     assert (output / "ssgm").exists() == disk_handoff
-    manifest = yaml.safe_load((output / "athmo" / "run_manifest.yaml").read_text())
-    assert manifest["atmosphere"] == {"solar_zenith_deg": 30.0, "month": 6}
+    assert (output / "athmo").exists() == disk_handoff
+    if disk_handoff:
+        with xr.open_dataset(output / "athmo" / "toa.nc") as saved:
+            expected = propagate(reflectance, atmosphere).image()
+            np.testing.assert_allclose(saved.radiance, expected)
+            assert saved.transmission.attrs["units"] == "1"
+            assert bool(saved.valid.all())
+        manifest = yaml.safe_load((output / "athmo" / "run_manifest.yaml").read_text())
+        assert manifest["atmosphere"] == {"solar_zenith_deg": 30.0, "month": 6}
 
 
 @pytest.mark.skipif(

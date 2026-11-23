@@ -1,4 +1,4 @@
-"""Check CPU backends against the Python reference using EOPL."""
+"""Check execution backends against the Python reference using EOPL."""
 
 import numpy as np
 import pytest
@@ -176,11 +176,19 @@ def test_dask_convolution_matches_python_across_chunk_edges(chunks):
 
 
 @pytest.mark.parametrize("precision", ["float32", "float64"])
-@pytest.mark.parametrize("backend", ["cpp", "dask"])
-def test_full_chain_matches_python(tmp_path, precision, backend):
+@pytest.mark.parametrize("backend", ["cpp", "dask", "cuda"])
+def test_full_chain_matches_python(tmp_path, monkeypatch, precision, backend):
     """Compare all four saved products on a rotated scene with noise and missing pixels."""
     if backend == "cpp":
         pytest.importorskip("chime_perf._cpp")
+    if backend == "cuda":
+        cupy = pytest.importorskip("cupy")
+        try:
+            device_count = cupy.cuda.runtime.getDeviceCount()
+        except cupy.cuda.runtime.CUDARuntimeError:
+            device_count = 0
+        if not device_count:
+            pytest.skip("A CUDA device is required.")
     rng = np.random.default_rng(42)
     input_wavelengths = np.arange(480.0, 623.0, 2)
     wavelengths = np.arange(480.0, 623.0)
@@ -274,3 +282,32 @@ def test_full_chain_matches_python(tmp_path, precision, backend):
             )
             for variable in expected.data_vars:
                 assert actual[variable].attrs == expected[variable].attrs
+
+    if backend == "cuda":
+        from chime_perf import run
+
+        # Verify the arrays arriving at each module are still on the GPU.
+        handoffs = []
+
+        def record_device(function):
+            def wrapped(*args, **kwargs):
+                handoffs.append(kwargs["data"].is_cuda)
+                return function(*args, **kwargs)
+
+            return wrapped
+
+        for name in ("athmo", "instrument", "reconstruction"):
+            monkeypatch.setattr(run, name, record_device(getattr(run, name)))
+
+        output = tmp_path / "cuda-memory"
+        main([
+            "--all", "--input", str(input_file), "--atmosphere", str(atmosphere_file),
+            "--config", str(settings_file), "--output", str(output),
+        ])
+        assert handoffs == [True, True, True]
+        assert {path.name for path in output.iterdir()} == {"reconstruction"}
+        name = "reconstruction/reconstructed.nc"
+        with xr.open_dataset(output / name) as memory, xr.open_dataset(
+            tmp_path / "cuda" / name
+        ) as disk:
+            xr.testing.assert_identical(memory, disk)

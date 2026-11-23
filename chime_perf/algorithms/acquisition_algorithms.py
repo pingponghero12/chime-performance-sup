@@ -5,6 +5,7 @@ import numpy as np
 import xarray as xr
 from dask import delayed
 from eopl import image_t
+from eopl.data import require_cupy
 from scipy.interpolate import RegularGridInterpolator
 
 from chime_perf.algorithms.algorithms import require_units
@@ -15,6 +16,12 @@ from chime_perf.algorithms.backends import (
     select_backend,
     tile_call,
     tiles,
+)
+from chime_perf.algorithms.gpu import (
+    convolve_downsample_cuda,
+    integrate_spectral_cuda,
+    on_device,
+    rotate_to_sensor_cuda,
 )
 
 
@@ -35,16 +42,18 @@ def spectral_response(
     sigma_nm = np.asarray(sigma_nm)
     if np.any(sigma_nm <= 0) or not np.isfinite(sigma_nm).all():
         raise ValueError("Spectral response widths must be finite and positive.")
-    centre_values = centre.values
-    if not np.isfinite(centre_values).all():
+    backend = select_backend(centres, backend)
+    xp = require_cupy() if backend == "cuda" else np
+    centre_values = xp.asarray(centre.data) if backend == "cuda" else centre.values
+    if not xp.isfinite(centre_values).all():
         raise ValueError("Channel centres must be finite.")
     if not np.isfinite(support_sigma) or support_sigma <= 0:
         raise ValueError("Kernel support must be finite and positive.")
 
     # Extend wavelengths at each edge's sampling interval to cover every response tail.
     radius = support_sigma * sigma_nm
-    lower = float(np.min(centre_values - radius))
-    upper = float(np.max(centre_values + radius))
+    lower = float(xp.min(centre_values - xp.asarray(radius)))
+    upper = float(xp.max(centre_values + xp.asarray(radius)))
     step_left = wavelength_nm[1] - wavelength_nm[0]
     step_right = wavelength_nm[-1] - wavelength_nm[-2]
     left = max(0, int(np.ceil((wavelength_nm[0] - lower) / step_left)))
@@ -58,7 +67,6 @@ def spectral_response(
     )
 
     count = wavelength_nm.size
-    backend = select_backend(centres, backend)
     if backend == "dask" and "detector_column" in centre.dims:
         # Each task builds a few detector columns using the same global padding.
         blocks = da.from_array(centre_values, chunks=(8, -1))
@@ -88,7 +96,8 @@ def spectral_response(
         )
     else:
         weights = spectral_response_python(
-            centre_values, sigma_nm, radius, padded_nm, left, count
+            centre_values, xp.asarray(sigma_nm), xp.asarray(radius),
+            xp.asarray(padded_nm), left, count, xp=xp,
         )
 
     coords = {name: centre[name] for name in centre.dims}
@@ -108,17 +117,17 @@ def spectral_response(
     return image_t(image)
 
 
-spectral_response.cuda_support = False
+spectral_response.cuda_support = True
 spectral_response.dask_support = True
 spectral_response.input_access = ("read",)
 
 
-def spectral_response_python(centre_values, sigma_nm, radius, padded_nm, left, count):
+def spectral_response_python(centre_values, sigma_nm, radius, padded_nm, left, count, xp=np):
     # The extra axis compares every channel centre with every input wavelength.
     distance = padded_nm - centre_values[..., None]
-    response = np.exp(-0.5 * (distance / sigma_nm[..., None]) ** 2)
-    response *= np.abs(distance) <= radius[..., None]
-    response *= np.gradient(padded_nm)
+    response = xp.exp(-0.5 * (distance / sigma_nm[..., None]) ** 2)
+    response *= xp.abs(distance) <= radius[..., None]
+    response *= xp.gradient(padded_nm)
 
     # Padded values equal the nearest edge sample. Add their weights to that sample
     # instead of allocating a padded copy of every image spectrum.
@@ -126,7 +135,7 @@ def spectral_response_python(centre_values, sigma_nm, radius, padded_nm, left, c
     weights[..., 0] += response[..., :left].sum(axis=-1)
     weights[..., -1] += response[..., left + count :].sum(axis=-1)
     total = weights.sum(axis=-1, keepdims=True)
-    if np.any(total == 0):
+    if xp.any(total == 0):
         raise ValueError(
             "Input spectral sampling is too sparse to resolve a channel response."
         )
@@ -200,7 +209,7 @@ def channel_centres(
     return image_t(centres)
 
 
-channel_centres.cuda_support = False
+channel_centres.cuda_support = True
 channel_centres.dask_support = True
 channel_centres.input_access = ("read",)
 
@@ -228,6 +237,12 @@ def integrate_spectral(
             threads,
             output_float32=output_float32,
         )
+    elif backend == "cuda":
+        output_float32 = run_options is not None and run_options.precision == "float32"
+        values = integrate_spectral_cuda(
+            source.data, column_coordinates(source, heading_deg, spacing_m),
+            weights.data, weights.detector_column.values, output_float32,
+        )
     else:
         columns = column_coordinates(source, heading_deg, spacing_m)
         values = integrate_spectral_python(
@@ -245,7 +260,7 @@ def integrate_spectral(
     return image_t(result)
 
 
-integrate_spectral.cuda_support = False
+integrate_spectral.cuda_support = True
 integrate_spectral.dask_support = True
 integrate_spectral.input_access = ("read", "read")
 
@@ -322,6 +337,8 @@ def rotate_to_sensor(data, heading_deg, edge_mode="edge", backend=None, threads=
                     lookup_y,
                     threads,
                 )
+            elif backend == "cuda":
+                values = rotate_to_sensor_cuda(source.data, act, alt, lookup_x, lookup_y)
             else:
                 values = rotate_to_sensor_python(source.values, act, alt, lookup_x, lookup_y)
             result = source.copy(data=values)
@@ -336,7 +353,7 @@ def rotate_to_sensor(data, heading_deg, edge_mode="edge", backend=None, threads=
     return image_t(result)
 
 
-rotate_to_sensor.cuda_support = False
+rotate_to_sensor.cuda_support = True
 rotate_to_sensor.dask_support = True
 rotate_to_sensor.input_access = ("read",)
 
@@ -400,6 +417,11 @@ def convolve_downsample(
             factor_alt,
             threads,
         )
+    elif backend == "cuda":
+        values = convolve_downsample_cuda(
+            source.data, kernel, (act.size, alt.size, source.sizes["SPE"]),
+            factor_act, factor_alt,
+        )
     else:
         radius_act, radius_alt = np.array(kernel.shape) // 2
         padding = ((radius_act, radius_act), (radius_alt, radius_alt), (0, 0))
@@ -414,7 +436,7 @@ def convolve_downsample(
     return image_t(result)
 
 
-convolve_downsample.cuda_support = False
+convolve_downsample.cuda_support = True
 convolve_downsample.dask_support = True
 convolve_downsample.input_access = ("read",)
 
@@ -470,26 +492,29 @@ def relative_radiance(data, lref, backend=None, threads=1):
     """Express noise-free radiance as a fraction of the reference radiance."""
     source = data.image()
     require_units(source, "W m-2 sr-1 um-1")
-    if select_backend(data, backend) == "cpp":
+    backend = select_backend(data, backend)
+    if backend == "cpp":
         image = cpp_spectral_formula("relative_radiance", source, threads, lref)
     else:
         # lref has one value per channel; it repeats across both spatial axes.
+        if backend == "cuda":
+            lref = on_device(lref)
         image = source.copy(data=(source / lref).data)
         if data.is_dask:
             image = image.copy(data=image.data.map_blocks(check_radiance, dtype=image.dtype))
         else:
-            check_radiance(image.values)
+            check_radiance(image.data)
     image.attrs["units"] = "1"
     return image_t(image)
 
 
-relative_radiance.cuda_support = False
+relative_radiance.cuda_support = True
 relative_radiance.dask_support = True
 relative_radiance.input_access = ("read",)
 
 
 def check_radiance(values):
-    if np.any(values[np.isfinite(values)] < 0):
+    if np.any(np.isfinite(values) & (values < 0)):
         raise ValueError("Noise-free radiance must be non-negative.")
     return values
 
@@ -498,15 +523,18 @@ def temporal_snr(data, g, n0, backend=None, threads=1):
     """Calculate SNR = g r / sqrt(r + N0)."""
     r = data.image()
     require_units(r, "1")
-    if select_backend(data, backend) == "cpp":
+    backend = select_backend(data, backend)
+    if backend == "cpp":
         result = cpp_spectral_formula("temporal_snr", r, threads, g, n0)
     else:
+        if backend == "cuda":
+            g, n0 = map(on_device, (g, n0))
         result = r.copy(data=(g * r / np.sqrt(r + n0)).data)
     result.attrs["units"] = "1"
     return image_t(result)
 
 
-temporal_snr.cuda_support = False
+temporal_snr.cuda_support = True
 temporal_snr.dask_support = True
 temporal_snr.input_access = ("read",)
 
@@ -515,15 +543,19 @@ def temporal_sigma(data, lref, g, n0, backend=None, threads=1):
     """Evaluate noise amplitude without dividing zero radiance by zero SNR."""
     r = data.image()
     require_units(r, "1")
-    if select_backend(data, backend) == "cpp":
-        result = cpp_spectral_formula("temporal_sigma", r, threads, lref / g, n0)
+    backend = select_backend(data, backend)
+    scale = lref / g
+    if backend == "cpp":
+        result = cpp_spectral_formula("temporal_sigma", r, threads, scale, n0)
     else:
-        result = r.copy(data=(lref / g * np.sqrt(r + n0)).data)
+        if backend == "cuda":
+            scale, n0 = map(on_device, (scale, n0))
+        result = r.copy(data=(scale * np.sqrt(r + n0)).data)
     result.attrs["units"] = "W m-2 sr-1 um-1"
     return image_t(result)
 
 
-temporal_sigma.cuda_support = False
+temporal_sigma.cuda_support = True
 temporal_sigma.dask_support = True
 temporal_sigma.input_access = ("read",)
 
@@ -531,14 +563,21 @@ temporal_sigma.input_access = ("read",)
 def draw_noise(data, rng, enabled=True, backend=None, threads=1):
     """Draw independent Gaussian errors in the supplied standard deviation's units."""
     sigma = data.image()
-    if select_backend(data, backend) == "cpp" and enabled:
+    backend = select_backend(data, backend)
+    if backend == "cpp" and enabled:
         # NumPy draws in the same order as Python. OpenMP applies the amplitudes.
         arranged = sigma.transpose("ACT", "ALT", "SPE")
         draws = xr.DataArray(rng.normal(size=sigma.shape), dims=sigma.dims)
         draws = np.ascontiguousarray(draws.transpose(*arranged.dims).values)
         values = native_module().scale_noise(cpp_pixels(arranged.values), draws, threads)
         return image_t(arranged.copy(deep=False, data=values).transpose(*sigma.dims))
-    if data.is_dask:
+    if backend == "cuda":
+        cp = require_cupy()
+        # Use the same NumPy draws as the CPU backends for a given seed.
+        values = cp.asarray(rng.normal(size=sigma.shape)) * sigma.data if enabled else (
+            cp.zeros(sigma.shape)
+        )
+    elif data.is_dask:
         if enabled:
             values = standard_noise_dask(rng, sigma.shape, sigma.chunks) * sigma.data
         else:
@@ -550,7 +589,7 @@ def draw_noise(data, rng, enabled=True, backend=None, threads=1):
     return image_t(sigma.copy(data=values))
 
 
-draw_noise.cuda_support = False
+draw_noise.cuda_support = True
 draw_noise.dask_support = True
 draw_noise.input_access = ("read",)
 
@@ -585,15 +624,18 @@ def electron_signal(data, a, b, backend=None, threads=1):
     """Calculate the paper's equivalent electron signal n = a + b r."""
     r = data.image()
     require_units(r, "1")
-    if select_backend(data, backend) == "cpp":
+    backend = select_backend(data, backend)
+    if backend == "cpp":
         result = cpp_spectral_formula("electron_signal", r, threads, a, b)
     else:
+        if backend == "cuda":
+            a, b = map(on_device, (a, b))
         result = r.copy(data=(a + b * r).data)
     result.attrs["units"] = "electron"
     return image_t(result)
 
 
-electron_signal.cuda_support = False
+electron_signal.cuda_support = True
 electron_signal.dask_support = True
 electron_signal.input_access = ("read",)
 
@@ -604,7 +646,8 @@ def absolute_offset(data, electrons, lref, a, b, coefficient, s0, backend=None, 
     n = electrons.image()
     require_units(signal, "W m-2 sr-1 um-1")
     require_units(n, "electron")
-    if select_backend(data, backend) == "cpp":
+    backend = select_backend(data, backend)
+    if backend == "cpp":
         source = signal.transpose("ACT", "ALT", "SPE")
         dtype = np.result_type(source.dtype, n.dtype)
         dtype = np.float32 if dtype == np.float32 else np.float64
@@ -618,7 +661,12 @@ def absolute_offset(data, electrons, lref, a, b, coefficient, s0, backend=None, 
             threads,
         )
         return image_t(source.copy(deep=False, data=values).transpose(*signal.dims))
-    if data.is_dask or electrons.is_dask:
+    xp = np
+    if backend == "cuda":
+        xp = require_cupy()
+        nonzero = n.data != 0
+        ratio = xp.where(nonzero, signal.data / xp.where(nonzero, n.data, 1), 0)
+    elif data.is_dask or electrons.is_dask:
         nonzero = n.data != 0
         ratio = da.where(nonzero, signal.data / da.where(nonzero, n.data, 1), 0)
     else:
@@ -626,12 +674,12 @@ def absolute_offset(data, electrons, lref, a, b, coefficient, s0, backend=None, 
         np.divide(signal.values, n.values, out=ratio, where=n.values != 0)
 
     # For a = 0, L / (b L / Lref) tends to Lref / b, including at L = 0.
-    zero_limit = (signal.data == 0) & (np.asarray(a) == 0)
-    ratio = np.where(zero_limit, np.asarray(lref / b), ratio)
+    zero_limit = (signal.data == 0) & (xp.asarray(a) == 0)
+    ratio = xp.where(zero_limit, xp.asarray(lref / b), ratio)
     return image_t(signal.copy(data=coefficient * s0 * ratio))
 
 
-absolute_offset.cuda_support = False
+absolute_offset.cuda_support = True
 absolute_offset.dask_support = True
 absolute_offset.input_access = ("read", "read")
 
@@ -655,7 +703,7 @@ def apply_absolute_error(data, noise, offset, gain, backend=None, threads=1):
     return image_t(source.copy(data=values.transpose(*source.dims).data))
 
 
-apply_absolute_error.cuda_support = False
+apply_absolute_error.cuda_support = True
 apply_absolute_error.dask_support = True
 apply_absolute_error.input_access = ("read", "read", "read")
 
@@ -677,7 +725,7 @@ def striping_gains(data, sigma, rng, enabled=True):
     return image_t(gains)
 
 
-striping_gains.cuda_support = False
+striping_gains.cuda_support = True
 striping_gains.dask_support = True
 striping_gains.input_access = ("read",)
 
@@ -701,7 +749,7 @@ def apply_striping(data, gains, backend=None, threads=1):
     return image_t(source.copy(data=values.data))
 
 
-apply_striping.cuda_support = False
+apply_striping.cuda_support = True
 apply_striping.dask_support = True
 apply_striping.input_access = ("read", "read")
 

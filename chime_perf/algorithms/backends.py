@@ -6,15 +6,15 @@ from dask import delayed
 
 
 def validate_backend(backend):
-    if backend in ("python", "dask", "cpp"):
+    if backend in ("python", "dask", "cpp", "cuda"):
         return backend
-    if backend == "cuda":
-        raise NotImplementedError(f"The CHIME {backend!r} backend is not implemented yet.")
     raise ValueError("backend must be python, dask, cpp, or cuda.")
 
 
 def select_backend(data, backend):
     if backend is None:
+        if data.is_cuda:
+            return "cuda"
         backend = "dask" if data.is_dask else "python"
     return validate_backend(backend)
 

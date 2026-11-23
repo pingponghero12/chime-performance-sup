@@ -46,7 +46,7 @@ On Windows, activate with `.venv\Scripts\activate` instead. The release also pro
 a universal Python wheel for local installation; it is the same file for all platforms.
 The project is distributed through GitHub releases.
 
-The `pipeline` extra installs EOPL (0.2.1 or later), Numba and Py6S for the mini E2E.
+The `pipeline` extra installs EOPL (0.3.0 or later), Numba and Py6S for the mini E2E.
 Use `python -m pip install .` if you only need the parametric model.
 Py6S also requires a separately installed **6S executable**; see its
 [installation guide](https://py6s.readthedocs.io/en/latest/installation.html).
@@ -136,7 +136,8 @@ are retained; negative/nonfinite source values become NaN, leaving gaps in plots
 With `--save-intermediates`, each module saves its product for the next one to load:
 `ssgm/scene.nc`, `athmo/toa.nc`, `instrument/instrument.nc` and
 `reconstruction/reconstructed.nc`. Each directory also contains a manifest and report.
-Omit the flag for in-memory handoff; `athmo/toa.nc` still archives the atmosphere.
+Omit the flag to pass the images and atmospheric coefficients in memory.
+The final product still includes the saved coefficients.
 Standalone modules save directly in `--output`.
 
 ### Input and configuration
@@ -161,7 +162,9 @@ paths for input and output, and give each run its own output directory.
 [Xarray's NetCDF notes](https://docs.xarray.dev/en/stable/user-guide/dask.html#reading-and-writing-data)
 Use `backend: cpp` and set `num_cores` for OpenMP. Build the optional extension
 with `python -m pip install -e '.[pipeline]' -Cwheel.cmake=true` using a C++17
-compiler and an OpenMP runtime. `cuda` is reserved for the GPU backend.
+compiler and an OpenMP runtime. Use `backend: cuda` with CuPy installed for your
+CUDA Toolkit. Images stay on the GPU between modules in memory mode. The 6S
+solver and optional spectral-library fitting run on the CPU.
 
 Input is a NetCDF cube named `reflectance`, with dimensions `ACT`, `ALT`, `SPE`,
 coordinate units `m`, `m`, `nm` and reflectance units `1`.

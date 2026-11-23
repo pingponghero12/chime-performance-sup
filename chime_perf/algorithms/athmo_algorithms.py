@@ -9,6 +9,7 @@ from eopl import image_t
 
 from chime_perf.algorithms.algorithms import require_units
 from chime_perf.algorithms.backends import cpp_spectral_formula, select_backend
+from chime_perf.algorithms.gpu import on_device
 
 
 def prepare_atmosphere(
@@ -188,7 +189,7 @@ def propagate(data, atmosphere, backend=None, threads=1):
 
     backend = select_backend(data, backend)
     reflectance, atmosphere = xr.align(
-        reflectance, atmosphere, join="exact", copy=backend != "cpp"
+        reflectance, atmosphere, join="exact", copy=backend not in ("cpp", "cuda")
     )
 
     units = {
@@ -217,6 +218,10 @@ def propagate(data, atmosphere, backend=None, threads=1):
             "propagate", reflectance, threads, path, scale, transmission, albedo
         )
     else:
+        if backend == "cuda":
+            path, scale, transmission, albedo = map(
+                on_device, (path, scale, transmission, albedo)
+            )
         # Missing scene values and nonphysical denominators stay masked as NaN.
         denominator = 1 - albedo * reflectance
         valid = np.isfinite(reflectance) & (reflectance >= 0) & (denominator > 0)
@@ -233,6 +238,6 @@ def propagate(data, atmosphere, backend=None, threads=1):
     return image_t(radiance)
 
 
-propagate.cuda_support = False
+propagate.cuda_support = True
 propagate.dask_support = True
 propagate.input_access = ("read",)

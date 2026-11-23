@@ -3,6 +3,7 @@
 import numpy as np
 import xarray as xr
 from eopl import image_t
+from eopl.data import require_cupy
 
 from chime_perf.algorithms.algorithms import require_units
 from chime_perf.algorithms.backends import cpp_spectral_formula, select_backend
@@ -17,10 +18,19 @@ def average_atmosphere(data, response):
     if not np.array_equal(quantity[quantity.dims[0]].values, weights.sample_SPE.values):
         raise ValueError("Atmospheric wavelengths must match the response wavelengths.")
 
-    values = np.empty(weights.sizes["SPE"])
-    for channel, weight in enumerate(weights.values):
-        support = weight > 0
-        values[channel] = quantity.values[support] @ weight[support]
+    if response.is_cuda:
+        cp = require_cupy()
+        weights_data = weights.data
+        values = cp.sum(
+            cp.where(weights_data > 0, cp.asarray(quantity.data) * weights_data, 0),
+            axis=-1,
+            dtype=cp.float64,
+        )
+    else:
+        values = np.empty(weights.sizes["SPE"])
+        for channel, weight in enumerate(weights.values):
+            support = weight > 0
+            values[channel] = quantity.values[support] @ weight[support]
 
     averaged = xr.DataArray(
         values,
@@ -32,7 +42,7 @@ def average_atmosphere(data, response):
     return image_t(averaged)
 
 
-average_atmosphere.cuda_support = False
+average_atmosphere.cuda_support = True
 average_atmosphere.dask_support = False
 average_atmosphere.input_access = ("read", "read")
 
@@ -54,7 +64,7 @@ def toa_reflectance(data, solar_scale, backend=None, threads=1):
     return image_t(result)
 
 
-toa_reflectance.cuda_support = False
+toa_reflectance.cuda_support = True
 toa_reflectance.dask_support = True
 toa_reflectance.input_access = ("read", "read")
 
@@ -71,7 +81,7 @@ def path_reflectance(data, solar_scale):
     return image_t(result)
 
 
-path_reflectance.cuda_support = False
+path_reflectance.cuda_support = True
 path_reflectance.dask_support = True
 path_reflectance.input_access = ("read", "read")
 
@@ -92,7 +102,7 @@ def remove_atmosphere(data, path, transmission, backend=None, threads=1):
     return image_t(result)
 
 
-remove_atmosphere.cuda_support = False
+remove_atmosphere.cuda_support = True
 remove_atmosphere.dask_support = True
 remove_atmosphere.input_access = ("read", "read", "read")
 
@@ -114,6 +124,6 @@ def surface_reflectance(data, spherical_albedo, backend=None, threads=1):
     return image_t(result)
 
 
-surface_reflectance.cuda_support = False
+surface_reflectance.cuda_support = True
 surface_reflectance.dask_support = True
 surface_reflectance.input_access = ("read", "read")

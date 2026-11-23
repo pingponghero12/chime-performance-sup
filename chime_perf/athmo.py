@@ -24,6 +24,7 @@ def athmo(
     sixs_path=None,
     data=None,
     save=True,
+    return_atmosphere=False,
 ):
     """Apply the atmosphere; return the radiance image for the next module."""
     pl = ChimePipeline(output_root=output_root)
@@ -114,4 +115,4 @@ def athmo(
         pl.save_output(image_t(data.image(), name="radiance"), "toa")
         pl.log.info(f"TOA radiance saved to {Path(output_root) / 'toa.nc'}")
 
-    return data
+    return (data, atmosphere) if return_atmosphere else data

@@ -8,6 +8,7 @@ from pathlib import Path
 import dask
 import xarray as xr
 from eopl import Pipeline, image_t
+from eopl.data import require_cupy
 
 from chime_perf.algorithms.backends import native_module, validate_backend
 
@@ -34,9 +35,11 @@ class ChimePipeline(Pipeline):
         self.dask_chunks = dask_chunks.copy()
         self.pixel_chunks = {"ACT": -1, "ALT": -1, "SPE": -1, **self.dask_chunks}
 
-        if options.get("use_cuda"):
-            raise NotImplementedError("CHIME's CUDA backend is not implemented.")
-        super().set_run_options(**options)
+        if options.pop("use_cuda", False) and self.backend != "cuda":
+            raise ValueError("Select backend: cuda to enable GPU execution.")
+        if self.backend == "cuda":
+            require_cupy()
+        super().set_run_options(use_cuda=self.backend == "cuda", **options)
         self.manifest["processing_backend"] = self.backend
         if self.backend == "dask":
             self.manifest["dask_chunks"] = self.dask_chunks.copy()

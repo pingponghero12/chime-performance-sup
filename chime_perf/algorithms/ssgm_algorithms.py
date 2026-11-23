@@ -10,6 +10,7 @@ from scipy.optimize import nnls
 
 from .algorithms import grid, reflectance_image
 from .backends import cpp_pixels, native_module, select_backend, tile_call, tiles
+from .gpu import interpolate_spatial_cuda, interpolate_spectral_cuda, on_device
 
 
 def spatial_grid(coordinates, detector_spacing_m, oversampling="auto"):
@@ -120,6 +121,8 @@ def interpolate_spatial(
                 axis,
                 threads,
             )
+        elif backend == "cuda":
+            values = interpolate_spatial_cuda(result.data, original, target, axis)
         else:
             values = interpolate_spatial_axis(result.values, original, target, axis)
 
@@ -146,7 +149,7 @@ def interpolate_spatial(
     return image_t(result)
 
 
-interpolate_spatial.cuda_support = False
+interpolate_spatial.cuda_support = True
 interpolate_spatial.dask_support = True
 interpolate_spatial.input_access = ("read",)
 
@@ -200,6 +203,9 @@ def interpolate_spectral(data, step_nm=None, backend=None, threads=1, run_option
             threads,
             output_float32=output_float32,
         )
+    elif backend == "cuda":
+        output_float32 = run_options is not None and run_options.precision == "float32"
+        result = interpolate_spectral_cuda(source.data, source_nm, target_nm, output_float32)
     else:
         result = interpolate_spectral_python(source.values, source_nm, target_nm)
 
@@ -215,7 +221,7 @@ def interpolate_spectral(data, step_nm=None, backend=None, threads=1, run_option
     return image_t(image)
 
 
-interpolate_spectral.cuda_support = False
+interpolate_spectral.cuda_support = True
 interpolate_spectral.dask_support = True
 interpolate_spectral.input_access = ("read",)
 
@@ -274,6 +280,7 @@ def fit_library(data, library, backend=None, threads=1):
     return image_t(image)
 
 
+# SciPy solves the optional non-negative fit on the host.
 fit_library.cuda_support = False
 fit_library.dask_support = True
 fit_library.input_access = ("read",)
@@ -317,12 +324,15 @@ def reconstruct_library(data, library, target_nm, backend=None, threads=1):
 
     # Interpolate the library once, then apply rho_m = sum_r c_r e_rm to every pixel.
     spectra = interp1d(source_nm, endmembers.values, axis=0)(target_nm)
-    if select_backend(data, backend) == "cpp":
+    backend = select_backend(data, backend)
+    if backend == "cpp":
         reflectance = native_module().reconstruct_library(
             np.ascontiguousarray(weights.values, dtype=float),
             np.ascontiguousarray(spectra.T, dtype=float),
             threads,
         )
+    elif backend == "cuda":
+        reflectance = weights.data @ on_device(spectra.T)
     else:
         reflectance = weights.data @ spectra.T
 
@@ -338,6 +348,6 @@ def reconstruct_library(data, library, target_nm, backend=None, threads=1):
     return image_t(image)
 
 
-reconstruct_library.cuda_support = False
+reconstruct_library.cuda_support = True
 reconstruct_library.dask_support = True
 reconstruct_library.input_access = ("read",)

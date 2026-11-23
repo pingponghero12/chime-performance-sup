@@ -26,6 +26,7 @@ def reconstruction(
     atmosphere_path=None,
     data=None,
     save=True,
+    atmosphere=None,
 ):
     """Retrieve BOA reflectance without invoking an atmospheric solver."""
     pl = ChimePipeline(output_root=output_root)
@@ -61,15 +62,19 @@ def reconstruction(
 
     # The archive is either embedded in the instrument product or supplied for
     # an in-memory handoff. YAML atmosphere settings never replace saved quantities.
-    coefficient_path = atmosphere_path if atmosphere_path is not None else input_path
-    if atmosphere_path is not None or product is None:
-        if coefficient_path is None:
-            raise ValueError("Supply the saved propagation product through atmosphere_path.")
-        with xr.open_dataset(coefficient_path) as source:
-            available = [name for name in names if name in source]
-            atmosphere = source[available].load()
-    else:
-        atmosphere = product
+    coefficient_path = None
+    if atmosphere is None:
+        coefficient_path = atmosphere_path if atmosphere_path is not None else input_path
+        if atmosphere_path is not None or product is None:
+            if coefficient_path is None:
+                raise ValueError(
+                    "Supply the saved propagation product through atmosphere_path."
+                )
+            with xr.open_dataset(coefficient_path) as source:
+                available = [name for name in names if name in source]
+                atmosphere = source[available].load()
+        else:
+            atmosphere = product
 
     if not all(name in atmosphere for name in names):
         raise ValueError("Reconstruction requires the saved P, S, T and C quantities.")
@@ -149,7 +154,9 @@ def reconstruction(
             pl.add_variable(f"band_{name}", channels[name].image(), pinned=True)
 
         pl.add_variable("valid", np.isfinite(data.image()), pinned=True)
-        pl.manifest["atmosphere_source"] = str(Path(coefficient_path).resolve())
+        pl.manifest["atmosphere_source"] = (
+            str(Path(coefficient_path).resolve()) if coefficient_path is not None else "in memory"
+        )
         pl.save_output(image_t(data.image(), name="reflectance"), "reconstructed")
         pl.log.info(f"BOA reflectance saved to {Path(output_root) / 'reconstructed.nc'}")
 

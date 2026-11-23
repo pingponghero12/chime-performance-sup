@@ -195,6 +195,7 @@ def test_full_chain_memory_and_disk_handoffs_agree(
             assert bool(np.isfinite(memory.reflectance).all())
             if not errors_enabled:
                 np.testing.assert_allclose(memory.reflectance, 0.2)
-    assert (tmp_path / "memory/athmo/toa.nc").is_file()
+    assert not (tmp_path / "memory/athmo/toa.nc").exists()
+    assert (tmp_path / "disk/athmo/toa.nc").is_file()
     assert not (tmp_path / "memory/instrument/instrument.nc").exists()
     assert (tmp_path / "disk/instrument/instrument.nc").is_file()

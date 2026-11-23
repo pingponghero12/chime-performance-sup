@@ -23,7 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 pipeline = [
-    "eopl>=0.2.1",
+    "eopl>=0.3.0",
     "dask[array]",
     "numba>=0.61",
     "Py6S>=1.9.2",
@@ -45,7 +45,7 @@ Paper = "https://spie.org/spie-sensors-imaging/presentation/CHIME-system-perform
 [tool.scikit-build]
 wheel.packages = ["chime_perf"]
 wheel.cmake = false
-sdist.include = ["CMakeLists.txt", "native/**"]
+sdist.include = ["CMakeLists.txt", "native/**", "chime_perf/algorithms/cuda/*.cu"]
 sdist.exclude = [".local-tools/**", "demo-input/**", "outputs/**", "**/*.so"]
 
 [tool.ruff]
