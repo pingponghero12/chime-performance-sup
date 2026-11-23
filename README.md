@@ -163,8 +163,8 @@ paths for input and output, and give each run its own output directory.
 Use `backend: cpp` and set `num_cores` for OpenMP. Build the optional extension
 with `python -m pip install -e '.[pipeline]' -Cwheel.cmake=true` using a C++17
 compiler and an OpenMP runtime. Use `backend: cuda` with CuPy installed for your
-CUDA Toolkit. Images stay on the GPU between modules in memory mode. The 6S
-solver and optional spectral-library fitting run on the CPU.
+CUDA Toolkit. Images stay on the GPU between modules in memory mode, including
+during spectral-library fitting. The 6S solver runs on the CPU.
 
 Input is a NetCDF cube named `reflectance`, with dimensions `ACT`, `ALT`, `SPE`,
 coordinate units `m`, `m`, `nm` and reflectance units `1`.

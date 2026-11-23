@@ -60,6 +60,75 @@ def propagate_cuda(reflectance, path, scale, transmission, albedo):
 
 
 @lru_cache
+def nnls_kernel():
+    cp = require_cupy()
+    source = Path(__file__).with_name("cuda") / "nnls.cu"
+    return cp.RawKernel(source.read_text(), "fit_nnls", options=("--fmad=false",))
+
+
+def fit_library_cuda(source, measured):
+    """Project onto the library span and solve each pixel's NNLS on device."""
+    cp = require_cupy()
+    bands, materials = measured.shape
+    if bands == 0 or materials == 0 or source.shape[-1] != bands:
+        raise ValueError("Expected a nonempty library on the measured bands.")
+
+    # For A = Q R, the part of b perpendicular to Q adds a constant to the
+    # residual. Solve the smaller problem ||R x - Q.T b|| with the same x.
+    q, r = cp.linalg.qr(cp.asarray(measured, dtype=cp.float64), mode="reduced")
+    rows = r.shape[0]
+    r = cp.ascontiguousarray(r)
+    source = cp.asarray(source, order="C")
+    pixels = source.reshape(-1, bands)
+    weights = cp.empty((len(pixels), materials), dtype=cp.float64)
+    failed = cp.zeros(1, dtype=cp.int32)
+    scale = np.max(np.abs(measured))
+    eps = np.finfo(np.float64).eps
+    rank_tolerance = np.float64(eps * max(bands, materials) * scale)
+    zero_scale = np.float64(10 * eps / (scale or 1))
+
+    double_workspace = rows * materials + 2 * rows + materials
+    index_workspace = 2 * materials
+    bytes_per_pixel = 8 * (double_workspace + bands + rows) + 4 * index_workspace
+    batch = max(1, min(len(pixels), 2**26 // bytes_per_pixel))
+    scratch = cp.empty((batch, double_workspace), dtype=cp.float64)
+    indices = cp.empty((batch, index_workspace), dtype=cp.int32)
+    solve = nnls_kernel()
+    for start in range(0, len(pixels), batch):
+        block = pixels[start : start + batch]
+        projected = cp.ascontiguousarray(block.astype(cp.float64, copy=False) @ q)
+        count = len(block)
+        solve(
+            ((count + 127) // 128,), (128,),
+            (
+                projected, r, weights[start : start + count], np.int32(count),
+                np.int32(rows), np.int32(materials), rank_tolerance, zero_scale, np.float64(np.nan),
+                scratch, indices, failed,
+            ),
+        )
+    if failed.item():
+        raise RuntimeError("The CUDA NNLS fit did not converge.")
+    return weights.reshape((*source.shape[:-1], materials))
+
+
+def reconstruct_library_cuda(weights, spectra, output_float32):
+    """Accumulate the weighted spectra in double precision and round by batch."""
+    cp = require_cupy()
+    weights = cp.asarray(weights)
+    if not output_float32:
+        return weights @ cp.asarray(spectra)
+
+    spectra = cp.asarray(spectra, dtype=cp.float64)
+    pixels = cp.ascontiguousarray(weights).reshape(-1, weights.shape[-1])
+    result = cp.empty((len(pixels), spectra.shape[1]), dtype=cp.float32)
+    batch = max(1, 2**26 // (8 * (pixels.shape[1] + spectra.shape[1])))
+    for start in range(0, len(pixels), batch):
+        block = slice(start, start + batch)
+        result[block] = pixels[block].astype(cp.float64, copy=False) @ spectra
+    return result.reshape((*weights.shape[:-1], spectra.shape[1]))
+
+
+@lru_cache
 def sampling_module():
     cp = require_cupy()
     source = Path(__file__).with_name("cuda") / "sampling.cu"

@@ -10,7 +10,12 @@ from scipy.optimize import nnls
 
 from .algorithms import grid, reflectance_image
 from .backends import cpp_pixels, native_module, select_backend, tile_call, tiles
-from .gpu import interpolate_spatial_cuda, interpolate_spectral_cuda, on_device
+from .gpu import (
+    fit_library_cuda,
+    interpolate_spatial_cuda,
+    interpolate_spectral_cuda,
+    reconstruct_library_cuda,
+)
 
 
 def spatial_grid(coordinates, detector_spacing_m, oversampling="auto"):
@@ -266,6 +271,8 @@ def fit_library(data, library, backend=None, threads=1):
             np.ascontiguousarray(measured.values, dtype=float),
             threads,
         )
+    elif backend == "cuda":
+        weights = fit_library_cuda(reflectance.data, measured.values)
     else:
         weights = fit_library_python(reflectance.values, measured.values)
 
@@ -280,8 +287,7 @@ def fit_library(data, library, backend=None, threads=1):
     return image_t(image)
 
 
-# SciPy solves the optional non-negative fit on the host.
-fit_library.cuda_support = False
+fit_library.cuda_support = True
 fit_library.dask_support = True
 fit_library.input_access = ("read",)
 
@@ -307,7 +313,7 @@ def fit_library_dask(values, measured):
     )
 
 
-def reconstruct_library(data, library, target_nm, backend=None, threads=1):
+def reconstruct_library(data, library, target_nm, backend=None, threads=1, run_options=None):
     """Reconstruct rho(lambda) as the weighted sum of the library spectra."""
     weights = data.image()
     endmembers = library["reflectance"].transpose("library_SPE", "material")
@@ -332,7 +338,8 @@ def reconstruct_library(data, library, target_nm, backend=None, threads=1):
             threads,
         )
     elif backend == "cuda":
-        reflectance = weights.data @ on_device(spectra.T)
+        output_float32 = run_options is not None and run_options.precision == "float32"
+        reflectance = reconstruct_library_cuda(weights.data, spectra.T, output_float32)
     else:
         reflectance = weights.data @ spectra.T
 

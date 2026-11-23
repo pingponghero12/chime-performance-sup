@@ -15,6 +15,16 @@ main = pytest.importorskip("chime_perf.run").main
 acquisition = pytest.importorskip("chime_perf.algorithms.acquisition_algorithms")
 
 
+def require_cuda():
+    cupy = pytest.importorskip("cupy")
+    try:
+        device_count = cupy.cuda.runtime.getDeviceCount()
+    except cupy.cuda.runtime.CUDARuntimeError:
+        device_count = 0
+    if not device_count:
+        pytest.skip("A CUDA device is required.")
+
+
 @pytest.mark.parametrize("input_dtype", [np.float32, np.float64])
 def test_cpp_spectral_interpolation_writes_requested_precision(input_dtype):
     """Round on write while preserving exact nodes, clamped edges and missing bands."""
@@ -58,11 +68,13 @@ def test_cpp_spectral_integration_preserves_positive_support(input_dtype):
     np.testing.assert_array_equal(rounded, expected.astype(np.float32))
 
 
-@pytest.mark.parametrize("backend", ["cpp", "dask"])
+@pytest.mark.parametrize("backend", ["cpp", "dask", "cuda"])
 def test_nnls_matches_python_with_missing_spectra(backend):
     """Fit mixtures, reject missing spectra and keep the material coordinates."""
     if backend == "cpp":
         pytest.importorskip("chime_perf._cpp")
+    if backend == "cuda":
+        require_cuda()
     rng = np.random.default_rng(2)
     measured = rng.uniform(0.05, 0.8, (12, 4))
     mixtures = rng.uniform(0, 0.5, (6, 7, 4))
@@ -93,7 +105,12 @@ def test_nnls_matches_python_with_missing_spectra(backend):
     def fit(data, library, backend):
         if backend == "dask":
             data = data.chunk({"ACT": 3, "ALT": 4})
-        return ssgm.fit_library(image_t(data), library, backend=backend, threads=2)
+        image = image_t(data)
+        if backend == "cuda":
+            image.to_device()
+        result = ssgm.fit_library(image, library, backend=backend, threads=2)
+        assert result.is_cuda == (backend == "cuda")
+        return result
 
     assert operation_compare_test(
         fit, fit, scene, library,
@@ -107,15 +124,34 @@ def test_nnls_matches_python_with_missing_spectra(backend):
     def reconstruct(data, library, target, backend):
         if backend == "dask":
             data = data.chunk({"ACT": 3, "ALT": 4})
-        return ssgm.reconstruct_library(
-            image_t(data), library, target, backend=backend, threads=2,
-        )
+        image = image_t(data)
+        if backend == "cuda":
+            image.to_device()
+        result = ssgm.reconstruct_library(image, library, target, backend=backend, threads=2)
+        assert result.is_cuda == (backend == "cuda")
+        return result
 
     assert operation_compare_test(
         reconstruct, reconstruct, weights, library, target,
         kwargs={"backend": backend}, reference_kwargs={"backend": "python"},
         rtol=1e-11, atol=1e-12,
     )
+
+
+def test_cuda_nnls_with_dependent_columns():
+    """Compare fitted spectra when more than one set of weights is valid."""
+    require_cuda()
+    from chime_perf.algorithms.gpu import fit_library_cuda
+
+    # The first two endmembers are identical and there are fewer bands than materials.
+    measured = np.array([[1., 1., 0.], [0., 0., 1.]])
+    source = np.array([[[.25, .75], [-1., 2.], [np.inf, .5], [0., 0.]]])
+    weights = fit_library_cuda(source, measured).get()
+
+    assert (weights[:, [0, 1, 3], :] >= 0).all()
+    np.testing.assert_allclose(weights[:, [0, 1, 3], :] @ measured.T,
+                               [[[.25, .75], [0., 2.], [0., 0.]]])
+    assert np.isnan(weights[0, 2]).all()
 
 
 def test_cpp_spectral_response_accepts_widths_by_detector_column():
@@ -182,13 +218,7 @@ def test_full_chain_matches_python(tmp_path, monkeypatch, precision, backend):
     if backend == "cpp":
         pytest.importorskip("chime_perf._cpp")
     if backend == "cuda":
-        cupy = pytest.importorskip("cupy")
-        try:
-            device_count = cupy.cuda.runtime.getDeviceCount()
-        except cupy.cuda.runtime.CUDARuntimeError:
-            device_count = 0
-        if not device_count:
-            pytest.skip("A CUDA device is required.")
+        require_cuda()
     rng = np.random.default_rng(42)
     input_wavelengths = np.arange(480.0, 623.0, 2)
     wavelengths = np.arange(480.0, 623.0)
