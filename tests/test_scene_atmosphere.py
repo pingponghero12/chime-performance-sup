@@ -199,6 +199,32 @@ def test_missing_scene_pixels_remain_missing(reflectance, atmosphere):
     assert np.isfinite(radiance.values[1, 1]).all()
 
 
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_cuda_atmosphere_fuses_formula_and_mask(reflectance, atmosphere, precision):
+    """Keep axis order and mask invalid samples at both working precisions."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        device_count = cupy.cuda.runtime.getDeviceCount()
+    except cupy.cuda.runtime.CUDARuntimeError:
+        device_count = 0
+    if not device_count:
+        pytest.skip("A CUDA device is required.")
+
+    source = reflectance.image().astype(precision)
+    source.data[0, 0] = [np.nan, np.inf, -0.1]
+    source.data[1, 0] = [0.0, 2.0, 3.0]
+    source = source.transpose("SPE", "ALT", "ACT")
+    atmosphere = atmosphere.astype(precision)
+    atmosphere.spherical_albedo.data[:] = 0.5
+
+    reference = propagate(eopl.image_t(source), atmosphere).image()
+    actual = propagate(eopl.image_t(source), atmosphere, backend="cuda")
+
+    assert actual.is_cuda
+    xr.testing.assert_identical(actual.host_image(), reference)
+    assert np.isnan(reference.sel(ACT=30, ALT=0)[1:]).all()
+
+
 def test_atmosphere_requires_matching_coordinates(reflectance, atmosphere):
     """A shifted coefficient grid must not silently discard spectral samples."""
     atmosphere = atmosphere.assign_coords(SPE=atmosphere.SPE + 1)

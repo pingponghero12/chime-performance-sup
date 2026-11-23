@@ -20,6 +20,46 @@ def on_device(value):
 
 
 @lru_cache
+def atmosphere_kernel():
+    cp = require_cupy()
+    return cp.ElementwiseKernel(
+        "T rho, T path, T gain, T albedo, T missing",
+        "T radiance",
+        """
+        const T denominator = T(1) - albedo * rho;
+        if (isfinite(rho) && rho >= T(0) && denominator > T(0)) {
+            radiance = path + gain * rho / denominator;
+        } else {
+            radiance = missing;
+        }
+        """,
+        "chime_propagate_atmosphere",
+        options=("--fmad=false",),
+    )
+
+
+def propagate_cuda(reflectance, path, scale, transmission, albedo):
+    """Apply the Lambertian equation and its validity check in one pass."""
+    cp = require_cupy()
+    source = reflectance.transpose(..., "SPE")
+    dtype = np.result_type(
+        np.float32, source.dtype, path.dtype, scale.dtype, transmission.dtype, albedo.dtype
+    )
+
+    # Compute the combined gain once per wavelength. CuPy broadcasts the
+    # coefficient vectors over the spatial axes without expanding them.
+    gain = scale * transmission
+    values = atmosphere_kernel()(
+        cp.asarray(source.data, dtype=dtype),
+        cp.asarray(path.data, dtype=dtype),
+        cp.asarray(gain.data, dtype=dtype),
+        cp.asarray(albedo.data, dtype=dtype),
+        dtype.type(np.nan),
+    )
+    return source.copy(deep=False, data=values).transpose(*reflectance.dims)
+
+
+@lru_cache
 def sampling_module():
     cp = require_cupy()
     source = Path(__file__).with_name("cuda") / "sampling.cu"
