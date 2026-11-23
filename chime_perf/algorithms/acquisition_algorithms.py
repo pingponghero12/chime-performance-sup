@@ -205,7 +205,9 @@ channel_centres.dask_support = True
 channel_centres.input_access = ("read",)
 
 
-def integrate_spectral(data, response, spacing_m, heading_deg, backend=None, threads=1):
+def integrate_spectral(
+    data, response, spacing_m, heading_deg, backend=None, threads=1, run_options=None
+):
     """Sum the input radiance with the response belonging to each detector column."""
     source = data.image().transpose("ACT", "ALT", "SPE")
     weights = response.image()
@@ -216,12 +218,15 @@ def integrate_spectral(data, response, spacing_m, heading_deg, backend=None, thr
         values = integrate_spectral_dask(source, weights, spacing_m, heading_deg)
     elif backend == "cpp":
         columns = column_coordinates(source, heading_deg, spacing_m)
+        # Accumulate in float64 and round directly into the requested output cube.
+        output_float32 = run_options is not None and run_options.precision == "float32"
         values = native_module().integrate(
             cpp_pixels(source.values),
             np.ascontiguousarray(columns, dtype=np.intp),
             np.ascontiguousarray(weights.values, dtype=float),
             np.ascontiguousarray(weights.detector_column.values, dtype=np.intp),
             threads,
+            output_float32=output_float32,
         )
     else:
         columns = column_coordinates(source, heading_deg, spacing_m)

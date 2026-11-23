@@ -36,6 +36,28 @@ def test_cpp_spectral_interpolation_writes_requested_precision(input_dtype):
     np.testing.assert_array_equal(rounded, reference.astype(np.float32))
 
 
+@pytest.mark.parametrize("input_dtype", [np.float32, np.float64])
+def test_cpp_spectral_integration_preserves_positive_support(input_dtype):
+    """Use the matching detector row and leave missing values outside support alone."""
+    native = pytest.importorskip("chime_perf._cpp")
+    pixels = np.array([[[np.nan, 8, 12, np.inf], [4, np.nan, 12, 16]]], dtype=input_dtype)
+    columns = np.array([[7, -3]], dtype=np.intp)
+    column_ids = np.array([7, -3], dtype=np.intp)
+    weights = np.array([
+        [[0, .25, .75, 0], [0, 0, 0, 1], [0, 0, 0, 0]],
+        [[.5, 0, .5, -1], [0, 1, 0, 0], [0, 0, 0, 0]],
+    ])
+    expected = np.array([[[11, np.inf, 0], [8, np.nan, 0]]])
+
+    full = native.integrate(pixels, columns, weights, column_ids, 2)
+    rounded = native.integrate(pixels, columns, weights, column_ids, 2, output_float32=True)
+
+    assert full.dtype == np.float64
+    assert rounded.dtype == np.float32
+    np.testing.assert_array_equal(full, expected)
+    np.testing.assert_array_equal(rounded, expected.astype(np.float32))
+
+
 @pytest.mark.parametrize("backend", ["cpp", "dask"])
 def test_nnls_matches_python_with_missing_spectra(backend):
     """Fit mixtures, reject missing spectra and keep the material coordinates."""

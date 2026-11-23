@@ -193,8 +193,14 @@ Array<double> rotate(
     return result;
 }
 
-template <class T>
-Array<double> integrate(
+struct ChannelSupport {
+    Index first = 0;
+    Index stop = 0;
+    std::vector<Index> sparse_bands;
+};
+
+template <class T, class Output>
+Array<Output> integrate_pixels(
     const Array<T>& values, const Array<Index>& columns, const Array<double>& weights,
     const Array<Index>& column_ids, int threads
 ) {
@@ -221,36 +227,70 @@ Array<double> integrate(
         }
         column_index[p] = match->second;
     }
-    // A missing sample outside a channel's support must never contaminate the sum.
-    using Link = std::pair<Index, double>;
-    std::vector<std::vector<Link>> support(ids.shape(0) * channels);
-    for (Index col = 0; col < ids.shape(0); ++col) {
-        for (Index channel = 0; channel < channels; ++channel) {
-            auto& links = support[col * channels + channel];
-            for (Index band = 0; band < bands; ++band) {
-                if (response(col, channel, band) > 0) {
-                    links.emplace_back(band, response(col, channel, band));
+    const auto* all_weights = weights.data();
+    std::vector<ChannelSupport> support(ids.shape(0) * channels);
+    for (Index row = 0; row < static_cast<Index>(support.size()); ++row) {
+        auto& interval = support[row];
+        const auto* channel_weights = all_weights + row * bands;
+        Index count = 0;
+        for (Index band = 0; band < bands; ++band) {
+            if (channel_weights[band] > 0) {
+                if (count == 0) {
+                    interval.first = band;
+                }
+                interval.stop = band + 1;
+                ++count;
+            }
+        }
+        // Gaussian responses usually have one continuous range of positive weights.
+        // If there are gaps, keep the exact band indices so missing samples stay masked.
+        if (count != interval.stop - interval.first) {
+            interval.sparse_bands.reserve(count);
+            for (Index band = interval.first; band < interval.stop; ++band) {
+                if (channel_weights[band] > 0) {
+                    interval.sparse_bands.push_back(band);
                 }
             }
         }
     }
-    Array<double> result({nx, ny, channels});
-    auto output = result.mutable_unchecked<3>();
+    Array<Output> result({nx, ny, channels});
+    auto* output = result.mutable_data();
+    const auto* input_values = values.data();
 
     py::gil_scoped_release release;
     #pragma omp parallel for num_threads(threads) schedule(static)
     for (Index p = 0; p < nx * ny; ++p) {
-        const Index x = p / ny, y = p % ny;
+        const auto* spectrum = input_values + p * bands;
         const Index first = column_index[p] * channels;
         for (Index channel = 0; channel < channels; ++channel) {
+            const Index row = first + channel;
+            const auto& interval = support[row];
+            const auto* channel_weights = all_weights + row * bands;
             double sum = 0;
-            for (const auto& [band, weight] : support[first + channel]) {
-                sum += input(x, y, band) * weight;
+            if (interval.sparse_bands.empty()) {
+                for (Index band = interval.first; band < interval.stop; ++band) {
+                    sum += spectrum[band] * channel_weights[band];
+                }
+            } else {
+                for (const Index band : interval.sparse_bands) {
+                    sum += spectrum[band] * channel_weights[band];
+                }
             }
-            output(x, y, channel) = sum;
+            output[p * channels + channel] = static_cast<Output>(sum);
         }
     }
     return result;
+}
+
+template <class T>
+py::array integrate(
+    const Array<T>& values, const Array<Index>& columns, const Array<double>& weights,
+    const Array<Index>& column_ids, int threads, bool output_float32
+) {
+    if (output_float32) {
+        return integrate_pixels<T, float>(values, columns, weights, column_ids, threads);
+    }
+    return integrate_pixels<T, double>(values, columns, weights, column_ids, threads);
 }
 
 template <class T>
@@ -373,7 +413,8 @@ void bind_precision(py::module_& module) {
     module.def("rotate", &rotate<T>, "values"_a.noconvert(), "act"_a.noconvert(),
                "alt"_a.noconvert(), "lookup_x"_a.noconvert(), "lookup_y"_a.noconvert(), "threads"_a);
     module.def("integrate", &integrate<T>, "values"_a.noconvert(), "columns"_a.noconvert(),
-               "weights"_a.noconvert(), "column_ids"_a.noconvert(), "threads"_a);
+               "weights"_a.noconvert(), "column_ids"_a.noconvert(), "threads"_a,
+               "output_float32"_a = false);
     module.def("convolve_downsample", &convolve_downsample<T>, "values"_a.noconvert(),
                "kernel"_a.noconvert(), "factor_act"_a, "factor_alt"_a, "threads"_a);
 }
