@@ -199,6 +199,32 @@ def test_missing_scene_pixels_remain_missing(reflectance, atmosphere):
     assert np.isfinite(radiance.values[1, 1]).all()
 
 
+@pytest.mark.parametrize("precision", ["float32", "float64"])
+def test_cuda_atmosphere_fuses_formula_and_mask(reflectance, atmosphere, precision):
+    """Keep axis order and mask invalid samples at both working precisions."""
+    cupy = pytest.importorskip("cupy")
+    try:
+        device_count = cupy.cuda.runtime.getDeviceCount()
+    except cupy.cuda.runtime.CUDARuntimeError:
+        device_count = 0
+    if not device_count:
+        pytest.skip("A CUDA device is required.")
+
+    source = reflectance.image().astype(precision)
+    source.data[0, 0] = [np.nan, np.inf, -0.1]
+    source.data[1, 0] = [0.0, 2.0, 3.0]
+    source = source.transpose("SPE", "ALT", "ACT")
+    atmosphere = atmosphere.astype(precision)
+    atmosphere.spherical_albedo.data[:] = 0.5
+
+    reference = propagate(eopl.image_t(source), atmosphere).image()
+    actual = propagate(eopl.image_t(source), atmosphere, backend="cuda")
+
+    assert actual.is_cuda
+    xr.testing.assert_identical(actual.host_image(), reference)
+    assert np.isnan(reference.sel(ACT=30, ALT=0)[1:]).all()
+
+
 def test_atmosphere_requires_matching_coordinates(reflectance, atmosphere):
     """A shifted coefficient grid must not silently discard spectral samples."""
     atmosphere = atmosphere.assign_coords(SPE=atmosphere.SPE + 1)
@@ -249,14 +275,16 @@ def test_all_matches_standalone_modules(tmp_path, reflectance, atmosphere, disk_
 
     main(arguments)
 
-    with xr.open_dataset(output / "athmo" / "toa.nc") as saved:
-        np.testing.assert_allclose(saved.radiance, propagate(reflectance, atmosphere).image())
-        assert saved.transmission.attrs["units"] == "1"
-        assert bool(saved.valid.all())
-
     assert (output / "ssgm").exists() == disk_handoff
-    manifest = yaml.safe_load((output / "athmo" / "run_manifest.yaml").read_text())
-    assert manifest["atmosphere"] == {"solar_zenith_deg": 30.0, "month": 6}
+    assert (output / "athmo").exists() == disk_handoff
+    if disk_handoff:
+        with xr.open_dataset(output / "athmo" / "toa.nc") as saved:
+            expected = propagate(reflectance, atmosphere).image()
+            np.testing.assert_allclose(saved.radiance, expected)
+            assert saved.transmission.attrs["units"] == "1"
+            assert bool(saved.valid.all())
+        manifest = yaml.safe_load((output / "athmo" / "run_manifest.yaml").read_text())
+        assert manifest["atmosphere"] == {"solar_zenith_deg": 30.0, "month": 6}
 
 
 @pytest.mark.skipif(

@@ -8,6 +8,8 @@ import xarray as xr
 from eopl import image_t
 
 from chime_perf.algorithms.algorithms import require_units
+from chime_perf.algorithms.backends import cpp_spectral_formula, select_backend
+from chime_perf.algorithms.gpu import propagate_cuda
 
 
 def prepare_atmosphere(
@@ -153,9 +155,8 @@ def combine_transmission(gas, downward, upward):
     return image_t(transmission)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 combine_transmission.cuda_support = False
-combine_transmission.dask_support = False
+combine_transmission.dask_support = True
 combine_transmission.input_access = ("read", "read", "read")
 
 
@@ -171,13 +172,12 @@ def calculate_solar_scale(irradiance, solar_zenith_deg):
     return image_t(scale)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
 calculate_solar_scale.cuda_support = False
-calculate_solar_scale.dask_support = False
+calculate_solar_scale.dask_support = True
 calculate_solar_scale.input_access = ("read",)
 
 
-def propagate(data, atmosphere):
+def propagate(data, atmosphere, backend=None, threads=1):
     """L = P + C T rho / (1 - S rho), on the reflectance cube's coordinates."""
     reflectance = data.image()
 
@@ -187,7 +187,10 @@ def propagate(data, atmosphere):
     if atmosphere.SPE.attrs.get("units") != "nm":
         raise ValueError("Atmospheric SPE coordinates must use nm.")
 
-    reflectance, atmosphere = xr.align(reflectance, atmosphere, join="exact")
+    backend = select_backend(data, backend)
+    reflectance, atmosphere = xr.align(
+        reflectance, atmosphere, join="exact", copy=backend not in ("cpp", "cuda")
+    )
 
     units = {
         "transmission": "1",
@@ -210,13 +213,20 @@ def propagate(data, atmosphere):
     if bool(((transmission < 0) | (albedo < 0) | (albedo >= 1) | (scale <= 0)).any()):
         raise ValueError("Need transmission >= 0, 0 <= albedo < 1 and solar scale > 0.")
 
-    # Missing scene values and nonphysical denominators stay masked as NaN.
-    denominator = 1 - albedo * reflectance
-    valid = np.isfinite(reflectance) & (reflectance >= 0) & (denominator > 0)
+    if backend == "cpp":
+        radiance = cpp_spectral_formula(
+            "propagate", reflectance, threads, path, scale, transmission, albedo
+        )
+    elif backend == "cuda":
+        radiance = propagate_cuda(reflectance, path, scale, transmission, albedo)
+    else:
+        # Missing scene values and nonphysical denominators stay masked as NaN.
+        denominator = 1 - albedo * reflectance
+        valid = np.isfinite(reflectance) & (reflectance >= 0) & (denominator > 0)
 
-    # Xarray repeats each SPE-only atmospheric coefficient across ACT and ALT pixels.
-    radiance = path + scale * transmission * reflectance / denominator.where(valid)
-    radiance = reflectance.copy(data=radiance.transpose(*reflectance.dims).data)
+        # Xarray repeats each SPE-only coefficient across ACT and ALT.
+        radiance = path + scale * transmission * reflectance / denominator.where(valid)
+        radiance = reflectance.copy(data=radiance.transpose(*reflectance.dims).data)
     radiance.attrs = {
         **reflectance.attrs,
         "units": "W m-2 sr-1 um-1",
@@ -226,7 +236,6 @@ def propagate(data, atmosphere):
     return image_t(radiance)
 
 
-# EOPL capabilities: these NumPy/SciPy operations read CPU images.
-propagate.cuda_support = False
-propagate.dask_support = False
+propagate.cuda_support = True
+propagate.dask_support = True
 propagate.input_access = ("read",)

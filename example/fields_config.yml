@@ -1,6 +1,9 @@
 # AVIRIS-NG agricultural scene; atmospheric settings are illustrative assumptions.
 run_options:
+  backend: python            # Or dask.
   precision: float32
+  # num_cores: 4              # Local Dask workers.
+  # dask_chunks: {ACT: 128, ALT: 128}  # Use one or both spatial axes.
 
 breakpoints: false
 

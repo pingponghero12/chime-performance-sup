@@ -1,14 +1,33 @@
 """Image operations for spectral response, spatial response and radiometric errors."""
 
+import dask.array as da
 import numpy as np
 import xarray as xr
+from dask import delayed
 from eopl import image_t
+from eopl.data import require_cupy
 from scipy.interpolate import RegularGridInterpolator
 
 from chime_perf.algorithms.algorithms import require_units
+from chime_perf.algorithms.backends import (
+    cpp_pixels,
+    cpp_spectral_formula,
+    native_module,
+    select_backend,
+    tile_call,
+    tiles,
+)
+from chime_perf.algorithms.gpu import (
+    convolve_downsample_cuda,
+    integrate_spectral_cuda,
+    on_device,
+    rotate_to_sensor_cuda,
+)
 
 
-def spectral_response(centres, wavelength_nm, sigma_nm, support_sigma=3):
+def spectral_response(
+    centres, wavelength_nm, sigma_nm, support_sigma=3, backend=None, threads=1
+):
     """Normalise Gaussian channel responses, repeating edge samples for missing tails."""
     wavelength_nm = np.asarray(wavelength_nm, dtype=float)
     if (
@@ -23,15 +42,18 @@ def spectral_response(centres, wavelength_nm, sigma_nm, support_sigma=3):
     sigma_nm = np.asarray(sigma_nm)
     if np.any(sigma_nm <= 0) or not np.isfinite(sigma_nm).all():
         raise ValueError("Spectral response widths must be finite and positive.")
-    if not np.isfinite(centre.values).all():
+    backend = select_backend(centres, backend)
+    xp = require_cupy() if backend == "cuda" else np
+    centre_values = xp.asarray(centre.data) if backend == "cuda" else centre.values
+    if not xp.isfinite(centre_values).all():
         raise ValueError("Channel centres must be finite.")
     if not np.isfinite(support_sigma) or support_sigma <= 0:
         raise ValueError("Kernel support must be finite and positive.")
 
     # Extend wavelengths at each edge's sampling interval to cover every response tail.
     radius = support_sigma * sigma_nm
-    lower = float(np.min(centre.values - radius))
-    upper = float(np.max(centre.values + radius))
+    lower = float(xp.min(centre_values - xp.asarray(radius)))
+    upper = float(xp.max(centre_values + xp.asarray(radius)))
     step_left = wavelength_nm[1] - wavelength_nm[0]
     step_right = wavelength_nm[-1] - wavelength_nm[-2]
     left = max(0, int(np.ceil((wavelength_nm[0] - lower) / step_left)))
@@ -44,24 +66,39 @@ def spectral_response(centres, wavelength_nm, sigma_nm, support_sigma=3):
         )
     )
 
-    # The extra axis compares every channel centre with every input wavelength.
-    distance = padded_nm - centre.values[..., None]
-    response = np.exp(-0.5 * (distance / sigma_nm[..., None]) ** 2)
-    response *= np.abs(distance) <= radius[..., None]
-    response *= np.gradient(padded_nm)
-
-    # Padded values equal the nearest edge sample. Add their weights to that sample
-    # instead of allocating a padded copy of every image spectrum.
     count = wavelength_nm.size
-    weights = response[..., left : left + count].copy()
-    weights[..., 0] += response[..., :left].sum(axis=-1)
-    weights[..., -1] += response[..., left + count :].sum(axis=-1)
-    total = weights.sum(axis=-1, keepdims=True)
-    if np.any(total == 0):
-        raise ValueError(
-            "Input spectral sampling is too sparse to resolve a channel response."
+    if backend == "dask" and "detector_column" in centre.dims:
+        # Each task builds a few detector columns using the same global padding.
+        blocks = da.from_array(centre_values, chunks=(8, -1))
+        weights = blocks.map_blocks(
+            spectral_response_python,
+            sigma_nm=sigma_nm,
+            radius=radius,
+            padded_nm=padded_nm,
+            left=left,
+            count=count,
+            new_axis=2,
+            chunks=(*blocks.chunks, (count,)),
+            dtype=float,
+            meta=np.empty((0, 0, 0)),
         )
-    weights /= total
+    elif backend == "cpp":
+        shape = centre_values.shape
+        weights = native_module().spectral_response(
+            np.ascontiguousarray(centre_values, dtype=float),
+            np.ascontiguousarray(np.broadcast_to(sigma_nm, shape), dtype=float).ravel(),
+            np.ascontiguousarray(np.broadcast_to(radius, shape), dtype=float).ravel(),
+            padded_nm,
+            np.gradient(padded_nm),
+            left,
+            count,
+            threads,
+        )
+    else:
+        weights = spectral_response_python(
+            centre_values, xp.asarray(sigma_nm), xp.asarray(radius),
+            xp.asarray(padded_nm), left, count, xp=xp,
+        )
 
     coords = {name: centre[name] for name in centre.dims}
     coords["sample_SPE"] = wavelength_nm
@@ -80,27 +117,61 @@ def spectral_response(centres, wavelength_nm, sigma_nm, support_sigma=3):
     return image_t(image)
 
 
+spectral_response.cuda_support = True
+spectral_response.dask_support = True
+spectral_response.input_access = ("read",)
+
+
+def spectral_response_python(centre_values, sigma_nm, radius, padded_nm, left, count, xp=np):
+    # The extra axis compares every channel centre with every input wavelength.
+    distance = padded_nm - centre_values[..., None]
+    response = xp.exp(-0.5 * (distance / sigma_nm[..., None]) ** 2)
+    response *= xp.abs(distance) <= radius[..., None]
+    response *= xp.gradient(padded_nm)
+
+    # Padded values equal the nearest edge sample. Add their weights to that sample
+    # instead of allocating a padded copy of every image spectrum.
+    weights = response[..., left : left + count].copy()
+    weights[..., 0] += response[..., :left].sum(axis=-1)
+    weights[..., -1] += response[..., left + count :].sum(axis=-1)
+    total = weights.sum(axis=-1, keepdims=True)
+    if xp.any(total == 0):
+        raise ValueError(
+            "Input spectral sampling is too sparse to resolve a channel response."
+        )
+    weights /= total
+    return weights
+
+
+def rotation_parameters(image, heading_deg):
+    """Use the same scene centre for all tiles."""
+    angle = np.deg2rad(heading_deg)
+    xc = float((image.ACT[0] + image.ACT[-1]) / 2)
+    yc = float((image.ALT[0] + image.ALT[-1]) / 2)
+    return xc, yc, np.cos(angle), np.sin(angle)
+
+
 def sensor_coordinates(image, heading_deg):
     """Map a sensor grid to the source map, rotating about the scene centre."""
-    angle = np.deg2rad(heading_deg)
-    xc = float((image.ACT[0] + image.ACT[-1]) / 2)
-    yc = float((image.ALT[0] + image.ALT[-1]) / 2)
-    a, b = np.meshgrid(image.ACT.values - xc, image.ALT.values - yc, indexing="ij")
-
-    x = xc + a * np.cos(angle) - b * np.sin(angle)
-    y = yc + a * np.sin(angle) + b * np.cos(angle)
-    return x, y
+    return rotated_coordinates(
+        image.ACT.values, image.ALT.values, rotation_parameters(image, heading_deg)
+    )
 
 
-def column_coordinates(image, heading_deg, detector_spacing_m):
-    """Find the detector ACT column covering each source-map pixel."""
-    angle = np.deg2rad(heading_deg)
-    xc = float((image.ACT[0] + image.ACT[-1]) / 2)
-    yc = float((image.ALT[0] + image.ALT[-1]) / 2)
-    x, y = np.meshgrid(image.ACT.values - xc, image.ALT.values - yc, indexing="ij")
+def rotated_coordinates(act, alt, rotation):
+    xc, yc, cosine, sine = rotation
+    a, b = (act - xc)[:, None], (alt - yc)[None, :]
+    return xc + a * cosine - b * sine, yc + a * sine + b * cosine
+
+
+def column_coordinates(image, heading_deg, detector_spacing_m, xs=slice(None), ys=slice(None)):
+    """Find the detector ACT column covering each requested source-map pixel."""
+    xc, yc, cosine, sine = rotation_parameters(image, heading_deg)
+    x = (image.ACT.values[xs] - xc)[:, None]
+    y = (image.ALT.values[ys] - yc)[None, :]
 
     # Inverse of the rotation used when evaluating the sensor-grid image.
-    sensor_act = xc + x * np.cos(angle) + y * np.sin(angle)
+    sensor_act = xc + x * cosine + y * sine
     column = np.floor((sensor_act - float(image.ACT[0])) / detector_spacing_m + 0.5)
     return column.astype(int)
 
@@ -114,7 +185,10 @@ def channel_centres(
     if not np.isfinite(common_fraction) or not 0 <= common_fraction <= 1:
         raise ValueError("spectral_error_common_fraction must be between zero and one.")
 
-    columns = column_coordinates(data.image(), heading_deg, spacing_m)
+    # The extrema of the affine detector coordinate occur at the image corners.
+    corners = slice(None, None, max(1, data.image().sizes["ACT"] - 1))
+    ends = slice(None, None, max(1, data.image().sizes["ALT"] - 1))
+    columns = column_coordinates(data.image(), heading_deg, spacing_m, corners, ends)
     indices = np.arange(columns.min(), columns.max() + 1)
     shifts = np.zeros((indices.size, len(nominal_nm)))
 
@@ -135,22 +209,45 @@ def channel_centres(
     return image_t(centres)
 
 
-def integrate_spectral(data, response, spacing_m, heading_deg):
+channel_centres.cuda_support = True
+channel_centres.dask_support = True
+channel_centres.input_access = ("read",)
+
+
+def integrate_spectral(
+    data, response, spacing_m, heading_deg, backend=None, threads=1, run_options=None
+):
     """Sum the input radiance with the response belonging to each detector column."""
     source = data.image().transpose("ACT", "ALT", "SPE")
     weights = response.image()
     if not np.array_equal(source.SPE.values, weights.sample_SPE.values):
         raise ValueError("Spectral response wavelengths must match the input image.")
-    columns = column_coordinates(source, heading_deg, spacing_m)
-    values = np.empty((*source.shape[:2], weights.sizes["SPE"]))
-
-    # Only non-zero weights contribute; missing distant bands do not mask a channel.
-    for column in weights.detector_column.values:
-        pixels = columns == column
-        for channel in range(weights.sizes["SPE"]):
-            weight = weights.sel(detector_column=column).values[channel]
-            support = weight > 0
-            values[pixels, channel] = source.values[pixels][:, support] @ weight[support]
+    backend = select_backend(data, backend)
+    if backend == "dask":
+        values = integrate_spectral_dask(source, weights, spacing_m, heading_deg)
+    elif backend == "cpp":
+        columns = column_coordinates(source, heading_deg, spacing_m)
+        # Accumulate in float64 and round directly into the requested output cube.
+        output_float32 = run_options is not None and run_options.precision == "float32"
+        values = native_module().integrate(
+            cpp_pixels(source.values),
+            np.ascontiguousarray(columns, dtype=np.intp),
+            np.ascontiguousarray(weights.values, dtype=float),
+            np.ascontiguousarray(weights.detector_column.values, dtype=np.intp),
+            threads,
+            output_float32=output_float32,
+        )
+    elif backend == "cuda":
+        output_float32 = run_options is not None and run_options.precision == "float32"
+        values = integrate_spectral_cuda(
+            source.data, column_coordinates(source, heading_deg, spacing_m),
+            weights.data, weights.detector_column.values, output_float32,
+        )
+    else:
+        columns = column_coordinates(source, heading_deg, spacing_m)
+        values = integrate_spectral_python(
+            source.values, columns, weights.values, weights.detector_column.values
+        )
 
     result = xr.DataArray(
         values,
@@ -163,25 +260,88 @@ def integrate_spectral(data, response, spacing_m, heading_deg):
     return image_t(result)
 
 
-def rotate_to_sensor(data, heading_deg, edge_mode="edge"):
+integrate_spectral.cuda_support = True
+integrate_spectral.dask_support = True
+integrate_spectral.input_access = ("read", "read")
+
+
+def integrate_spectral_python(pixels, columns, weights, column_ids):
+    values = np.empty((*pixels.shape[:2], weights.shape[1]))
+
+    # Only non-zero weights contribute; missing distant bands do not mask a channel.
+    for index, column in enumerate(column_ids):
+        mask = columns == column
+        samples = pixels[mask]
+        if not samples.size:
+            continue
+        for channel, weight in enumerate(weights[index]):
+            support = weight > 0
+            values[mask, channel] = samples[:, support] @ weight[support]
+    return values
+
+
+def integrate_spectral_dask(source, weights, spacing_m, heading_deg):
+    pixels = da.asarray(source.data).rechunk({2: -1})
+    responses = weights.data
+    column_ids = weights.detector_column.values
+    shape = (*pixels.shape[:2], weights.sizes["SPE"])
+
+    def make_tile(xs, ys):
+        tile_columns = column_coordinates(source, heading_deg, spacing_m, xs, ys)
+        first = np.searchsorted(column_ids, tile_columns.min())
+        last = np.searchsorted(column_ids, tile_columns.max(), side="right")
+        needed = slice(first, last)
+        return tile_call(
+            integrate_spectral_python,
+            pixels[xs, ys],
+            tile_columns,
+            responses[needed],
+            column_ids[needed],
+        )
+
+    return tiles(pixels, shape, make_tile)
+
+
+def rotate_to_sensor(data, heading_deg, edge_mode="edge", backend=None, threads=1):
     """Evaluate the map radiance at the rotated sensor-grid coordinates."""
     if edge_mode != "edge":
         raise ValueError("Only edge padding is supported.")
     source = data.image()
-    x, y = sensor_coordinates(source, heading_deg)
-
-    if heading_deg == 0:
-        result = source.copy(deep=True)
-    else:
-        interpolate = RegularGridInterpolator(
-            (source.ACT.values, source.ALT.values),
-            source.values,
-            bounds_error=True,
+    backend = select_backend(data, backend)
+    act, alt = source.ACT.values, source.ALT.values
+    rotation = rotation_parameters(source, heading_deg)
+    if backend == "dask":
+        pixels = da.asarray(source.data)
+        x, y = rotated_coordinates(
+            da.from_array(act, chunks=pixels.chunks[0]),
+            da.from_array(alt, chunks=pixels.chunks[1]),
+            rotation,
         )
-        # Clip only the lookup positions: values outside the map repeat its nearest edge.
-        lookup_x = np.clip(x, source.ACT.values[0], source.ACT.values[-1])
-        lookup_y = np.clip(y, source.ALT.values[0], source.ALT.values[-1])
-        result = source.copy(data=interpolate(np.stack((lookup_x, lookup_y), axis=-1)))
+        values = (
+            pixels if heading_deg == 0 else rotate_to_sensor_dask(pixels, act, alt, rotation)
+        )
+        result = source.copy(data=values)
+    else:
+        x, y = sensor_coordinates(source, heading_deg)
+        if heading_deg == 0:
+            result = source.copy(deep=True)
+        else:
+            lookup_x = np.clip(x, act[0], act[-1])
+            lookup_y = np.clip(y, alt[0], alt[-1])
+            if backend == "cpp":
+                values = native_module().rotate(
+                    cpp_pixels(source.values),
+                    np.ascontiguousarray(act, dtype=float),
+                    np.ascontiguousarray(alt, dtype=float),
+                    lookup_x,
+                    lookup_y,
+                    threads,
+                )
+            elif backend == "cuda":
+                values = rotate_to_sensor_cuda(source.data, act, alt, lookup_x, lookup_y)
+            else:
+                values = rotate_to_sensor_python(source.values, act, alt, lookup_x, lookup_y)
+            result = source.copy(data=values)
 
     # These coordinates retain the original map position of every output centre.
     result = result.assign_coords(map_ACT=(("ACT", "ALT"), x), map_ALT=(("ACT", "ALT"), y))
@@ -193,7 +353,43 @@ def rotate_to_sensor(data, heading_deg, edge_mode="edge"):
     return image_t(result)
 
 
-def convolve_downsample(data, kernel, factor_act, factor_alt, edge_mode="edge"):
+rotate_to_sensor.cuda_support = True
+rotate_to_sensor.dask_support = True
+rotate_to_sensor.input_access = ("read",)
+
+
+def rotate_to_sensor_python(values, act, alt, x, y):
+    interpolate = RegularGridInterpolator((act, alt), values, bounds_error=True)
+    return interpolate(np.stack((x, y), axis=-1))
+
+
+def rotate_tile(values, act, alt, target_act, target_alt, rotation):
+    x, y = rotated_coordinates(target_act, target_alt, rotation)
+    return rotate_to_sensor_python(
+        values, act, alt, np.clip(x, act[0], act[-1]), np.clip(y, alt[0], alt[-1])
+    )
+
+
+def rotate_to_sensor_dask(values, act, alt, rotation):
+    def make_tile(xs, ys):
+        target_act, target_alt = act[xs], alt[ys]
+        # The four rotated corners bound all source coordinates for this output tile.
+        x, y = rotated_coordinates(target_act[[0, -1]], target_alt[[0, -1]], rotation)
+        # SciPy uses the interval to the right at exact nodes, except at the far edge.
+        ia = (np.searchsorted(act, x, side="right") - 1).clip(0, len(act) - 2)
+        ib = (np.searchsorted(alt, y, side="right") - 1).clip(0, len(alt) - 2)
+        ix = slice(ia.min(), ia.max() + 2)
+        iy = slice(ib.min(), ib.max() + 2)
+        return tile_call(
+            rotate_tile, values[ix, iy], act[ix], alt[iy], target_act, target_alt, rotation
+        )
+
+    return tiles(values, values.shape, make_tile)
+
+
+def convolve_downsample(
+    data, kernel, factor_act, factor_alt, edge_mode="edge", backend=None, threads=1
+):
     """Evaluate spatial convolution only at the nominal centres that will be kept."""
     source = data.image()
     kernel = np.asarray(kernel, dtype=float)
@@ -206,23 +402,30 @@ def convolve_downsample(data, kernel, factor_act, factor_alt, edge_mode="edge"):
     if edge_mode != "edge":
         raise ValueError("Only edge padding is supported.")
 
-    radius_act, radius_alt = np.array(kernel.shape) // 2
     act = np.arange(0, source.sizes["ACT"], factor_act)
     alt = np.arange(0, source.sizes["ALT"], factor_alt)
-
-    # Repeat the outermost values for the full kernel radius; keep every nominal centre.
-    padded = np.pad(
-        source.values,
-        ((radius_act, radius_act), (radius_alt, radius_alt), (0, 0)),
-        mode="edge",
-    )
-    values = np.empty((act.size, alt.size, source.sizes["SPE"]))
-
-    for i, u in enumerate(act):
-        for j, v in enumerate(alt):
-            patch = padded[u : u + kernel.shape[0], v : v + kernel.shape[1], :]
-            # Reverse the kernel for convolution (rather than correlation).
-            values[i, j] = np.einsum("abk,ab->k", patch, kernel[::-1, ::-1])
+    backend = select_backend(data, backend)
+    if backend == "dask":
+        values = convolve_downsample_dask(
+            source.data, kernel, act, alt, factor_act, factor_alt
+        )
+    elif backend == "cpp":
+        values = native_module().convolve_downsample(
+            cpp_pixels(source.values),
+            np.ascontiguousarray(kernel),
+            factor_act,
+            factor_alt,
+            threads,
+        )
+    elif backend == "cuda":
+        values = convolve_downsample_cuda(
+            source.data, kernel, (act.size, alt.size, source.sizes["SPE"]),
+            factor_act, factor_alt,
+        )
+    else:
+        radius_act, radius_alt = np.array(kernel.shape) // 2
+        padding = ((radius_act, radius_act), (radius_alt, radius_alt), (0, 0))
+        values = convolve_downsample_python(source.values, kernel, act, alt, padding)
 
     result = source.isel(ACT=act, ALT=alt).copy(data=values)
     result.attrs["spatial_edge_mode"] = edge_mode
@@ -233,72 +436,276 @@ def convolve_downsample(data, kernel, factor_act, factor_alt, edge_mode="edge"):
     return image_t(result)
 
 
-def relative_radiance(data, lref):
+convolve_downsample.cuda_support = True
+convolve_downsample.dask_support = True
+convolve_downsample.input_access = ("read",)
+
+
+def convolve_downsample_python(values, kernel, act, alt, padding):
+    padded = np.pad(values, padding, mode="edge")
+    result = np.empty((act.size, alt.size, values.shape[2]))
+
+    for i, u in enumerate(act):
+        for j, v in enumerate(alt):
+            patch = padded[u : u + kernel.shape[0], v : v + kernel.shape[1], :]
+            # Reverse the kernel for convolution (rather than correlation).
+            result[i, j] = np.einsum("abk,ab->k", patch, kernel[::-1, ::-1])
+    return result
+
+
+def convolve_downsample_dask(values, kernel, act, alt, factor_act, factor_alt):
+    values = da.asarray(values)
+    radius_act, radius_alt = np.array(kernel.shape) // 2
+    shape = (len(act), len(alt), values.shape[2])
+    tile_sizes = (
+        max(1, max(values.chunks[0]) // factor_act),
+        max(1, max(values.chunks[1]) // factor_alt),
+    )
+
+    def make_tile(xs, ys):
+        # Tile on the global detector grid. Read actual neighbours at internal seams.
+        centres_act, centres_alt = act[xs], alt[ys]
+        act_start, act_stop = centres_act[0] - radius_act, centres_act[-1] + radius_act + 1
+        alt_start, alt_stop = centres_alt[0] - radius_alt, centres_alt[-1] + radius_alt + 1
+        ix = slice(max(0, act_start), min(values.shape[0], act_stop))
+        iy = slice(max(0, alt_start), min(values.shape[1], alt_stop))
+
+        # Repeat edge values only outside the whole image.
+        padding = (
+            (ix.start - act_start, act_stop - ix.stop),
+            (iy.start - alt_start, alt_stop - iy.stop),
+            (0, 0),
+        )
+        return tile_call(
+            convolve_downsample_python,
+            values[ix, iy],
+            kernel,
+            centres_act - centres_act[0],
+            centres_alt - centres_alt[0],
+            padding,
+        )
+
+    return tiles(values, shape, make_tile, tile_sizes)
+
+
+def relative_radiance(data, lref, backend=None, threads=1):
     """Express noise-free radiance as a fraction of the reference radiance."""
     source = data.image()
     require_units(source, "W m-2 sr-1 um-1")
-    # lref has one value per channel; it repeats across both spatial axes.
-    image = source.copy(data=(source / lref).data)
+    backend = select_backend(data, backend)
+    if backend == "cpp":
+        image = cpp_spectral_formula("relative_radiance", source, threads, lref)
+    else:
+        # lref has one value per channel; it repeats across both spatial axes.
+        if backend == "cuda":
+            lref = on_device(lref)
+        image = source.copy(data=(source / lref).data)
+        if data.is_dask:
+            image = image.copy(data=image.data.map_blocks(check_radiance, dtype=image.dtype))
+        else:
+            check_radiance(image.data)
     image.attrs["units"] = "1"
-    if np.any(image.values[np.isfinite(image)] < 0):
-        raise ValueError("Noise-free radiance must be non-negative.")
     return image_t(image)
 
 
-def temporal_snr(data, g, n0):
+relative_radiance.cuda_support = True
+relative_radiance.dask_support = True
+relative_radiance.input_access = ("read",)
+
+
+def check_radiance(values):
+    if np.any(np.isfinite(values) & (values < 0)):
+        raise ValueError("Noise-free radiance must be non-negative.")
+    return values
+
+
+def temporal_snr(data, g, n0, backend=None, threads=1):
     """Calculate SNR = g r / sqrt(r + N0)."""
     r = data.image()
     require_units(r, "1")
-    result = r.copy(data=(g * r / np.sqrt(r + n0)).data)
+    backend = select_backend(data, backend)
+    if backend == "cpp":
+        result = cpp_spectral_formula("temporal_snr", r, threads, g, n0)
+    else:
+        if backend == "cuda":
+            g, n0 = map(on_device, (g, n0))
+        result = r.copy(data=(g * r / np.sqrt(r + n0)).data)
     result.attrs["units"] = "1"
     return image_t(result)
 
 
-def temporal_sigma(data, lref, g, n0):
+temporal_snr.cuda_support = True
+temporal_snr.dask_support = True
+temporal_snr.input_access = ("read",)
+
+
+def temporal_sigma(data, lref, g, n0, backend=None, threads=1):
     """Evaluate noise amplitude without dividing zero radiance by zero SNR."""
     r = data.image()
     require_units(r, "1")
-    result = r.copy(data=(lref / g * np.sqrt(r + n0)).data)
+    backend = select_backend(data, backend)
+    scale = lref / g
+    if backend == "cpp":
+        result = cpp_spectral_formula("temporal_sigma", r, threads, scale, n0)
+    else:
+        if backend == "cuda":
+            scale, n0 = map(on_device, (scale, n0))
+        result = r.copy(data=(scale * np.sqrt(r + n0)).data)
     result.attrs["units"] = "W m-2 sr-1 um-1"
     return image_t(result)
 
 
-def draw_noise(data, rng, enabled=True):
+temporal_sigma.cuda_support = True
+temporal_sigma.dask_support = True
+temporal_sigma.input_access = ("read",)
+
+
+def draw_noise(data, rng, enabled=True, backend=None, threads=1):
     """Draw independent Gaussian errors in the supplied standard deviation's units."""
     sigma = data.image()
-    values = rng.normal(size=sigma.shape) * sigma.values if enabled else np.zeros(sigma.shape)
+    backend = select_backend(data, backend)
+    if backend == "cpp" and enabled:
+        # NumPy draws in the same order as Python. OpenMP applies the amplitudes.
+        arranged = sigma.transpose("ACT", "ALT", "SPE")
+        draws = xr.DataArray(rng.normal(size=sigma.shape), dims=sigma.dims)
+        draws = np.ascontiguousarray(draws.transpose(*arranged.dims).values)
+        values = native_module().scale_noise(cpp_pixels(arranged.values), draws, threads)
+        return image_t(arranged.copy(deep=False, data=values).transpose(*sigma.dims))
+    if backend == "cuda":
+        cp = require_cupy()
+        # Use the same NumPy draws as the CPU backends for a given seed.
+        values = cp.asarray(rng.normal(size=sigma.shape)) * sigma.data if enabled else (
+            cp.zeros(sigma.shape)
+        )
+    elif data.is_dask:
+        if enabled:
+            values = standard_noise_dask(rng, sigma.shape, sigma.chunks) * sigma.data
+        else:
+            values = da.zeros(sigma.shape, chunks=sigma.chunks)
+    else:
+        values = (
+            rng.normal(size=sigma.shape) * sigma.values if enabled else np.zeros(sigma.shape)
+        )
     return image_t(sigma.copy(data=values))
 
 
-def electron_signal(data, a, b):
+draw_noise.cuda_support = True
+draw_noise.dask_support = True
+draw_noise.input_access = ("read",)
+
+
+def draw_standard_block(bit_generator, state, count):
+    generator = bit_generator()
+    generator.state = state
+    return np.random.Generator(generator).standard_normal(count)
+
+
+def standard_noise_dask(rng, shape, chunks):
+    """Retain the reference seed sequence without allocating a whole noise cube."""
+    size = int(np.prod(shape))
+    if not size:
+        return da.empty(shape, chunks=chunks)
+    buffer = np.empty(min(2**20, size))
+    bit_generator = type(rng.bit_generator)
+    blocks = []
+    for start in range(0, size, buffer.size):
+        length = min(buffer.size, size - start)
+        task = delayed(draw_standard_block, pure=True)(
+            bit_generator, rng.bit_generator.state, length
+        )
+        blocks.append(da.from_delayed(task, shape=(length,), dtype=float))
+        # Advance the shared RNG now so RXRA starts at the same state as in Python.
+        # The worker later regenerates that block from its saved state.
+        rng.standard_normal(out=buffer[:length])
+    return da.concatenate(blocks).reshape(shape).rechunk(chunks)
+
+
+def electron_signal(data, a, b, backend=None, threads=1):
     """Calculate the paper's equivalent electron signal n = a + b r."""
     r = data.image()
     require_units(r, "1")
-    result = r.copy(data=(a + b * r).data)
+    backend = select_backend(data, backend)
+    if backend == "cpp":
+        result = cpp_spectral_formula("electron_signal", r, threads, a, b)
+    else:
+        if backend == "cuda":
+            a, b = map(on_device, (a, b))
+        result = r.copy(data=(a + b * r).data)
     result.attrs["units"] = "electron"
     return image_t(result)
 
 
-def absolute_offset(data, electrons, lref, a, b, coefficient, s0):
+electron_signal.cuda_support = True
+electron_signal.dask_support = True
+electron_signal.input_access = ("read",)
+
+
+def absolute_offset(data, electrons, lref, a, b, coefficient, s0, backend=None, threads=1):
     """Calculate the additive ARA term, with the explicit zero-radiance limit."""
     signal = data.image()
     n = electrons.image()
     require_units(signal, "W m-2 sr-1 um-1")
     require_units(n, "electron")
-    ratio = np.zeros(signal.shape)
-    np.divide(signal.values, n.values, out=ratio, where=n.values != 0)
+    backend = select_backend(data, backend)
+    if backend == "cpp":
+        source = signal.transpose("ACT", "ALT", "SPE")
+        dtype = np.result_type(source.dtype, n.dtype)
+        dtype = np.float32 if dtype == np.float32 else np.float64
+        bands = (source.sizes["SPE"],)
+        values = native_module().absolute_offset(
+            np.ascontiguousarray(source.values, dtype=dtype),
+            np.ascontiguousarray(n.transpose(*source.dims).values, dtype=dtype),
+            np.ascontiguousarray(np.broadcast_to(lref / b, bands), dtype=float),
+            np.ascontiguousarray(np.broadcast_to(np.asarray(a) == 0, bands)),
+            coefficient * s0,
+            threads,
+        )
+        return image_t(source.copy(deep=False, data=values).transpose(*signal.dims))
+    xp = np
+    if backend == "cuda":
+        xp = require_cupy()
+        nonzero = n.data != 0
+        ratio = xp.where(nonzero, signal.data / xp.where(nonzero, n.data, 1), 0)
+    elif data.is_dask or electrons.is_dask:
+        nonzero = n.data != 0
+        ratio = da.where(nonzero, signal.data / da.where(nonzero, n.data, 1), 0)
+    else:
+        ratio = np.zeros(signal.shape)
+        np.divide(signal.values, n.values, out=ratio, where=n.values != 0)
 
     # For a = 0, L / (b L / Lref) tends to Lref / b, including at L = 0.
-    zero_limit = (signal.values == 0) & (np.asarray(a) == 0)
-    ratio = np.where(zero_limit, np.asarray(lref / b), ratio)
+    zero_limit = (signal.data == 0) & (xp.asarray(a) == 0)
+    ratio = xp.where(zero_limit, xp.asarray(lref / b), ratio)
     return image_t(signal.copy(data=coefficient * s0 * ratio))
 
 
-def apply_absolute_error(data, noise, offset, gain):
+absolute_offset.cuda_support = True
+absolute_offset.dask_support = True
+absolute_offset.input_access = ("read", "read")
+
+
+def apply_absolute_error(data, noise, offset, gain, backend=None, threads=1):
     """Multiply only the signal by the ARA gain; retain the original noise draw."""
     source = data.image()
+    if select_backend(data, backend) == "cpp":
+        source, draws, bias = xr.align(
+            source, noise.image(), offset.image(), join="exact", copy=False
+        )
+        dtype = np.result_type(source.dtype, draws.dtype, bias.dtype, gain)
+        dtype = np.float32 if dtype == np.float32 else np.float64
+        pixels = np.ascontiguousarray(source.values, dtype=dtype)
+        draws = np.ascontiguousarray(draws.transpose(*source.dims).values, dtype=dtype)
+        bias = np.ascontiguousarray(bias.transpose(*source.dims).values, dtype=dtype)
+        values = native_module().apply_absolute_error(pixels, draws, bias, gain, threads)
+        return image_t(source.copy(deep=False, data=values))
+
     values = gain * source + noise.image() + offset.image()
     return image_t(source.copy(data=values.transpose(*source.dims).data))
+
+
+apply_absolute_error.cuda_support = True
+apply_absolute_error.dask_support = True
+apply_absolute_error.input_access = ("read", "read", "read")
 
 
 def striping_gains(data, sigma, rng, enabled=True):
@@ -318,12 +725,33 @@ def striping_gains(data, sigma, rng, enabled=True):
     return image_t(gains)
 
 
-def apply_striping(data, gains):
+striping_gains.cuda_support = True
+striping_gains.dask_support = True
+striping_gains.input_access = ("read",)
+
+
+def apply_striping(data, gains, backend=None, threads=1):
     """Apply the saved column gain to every ALT pixel."""
     source = data.image()
+    if select_backend(data, backend) == "cpp":
+        arranged = source.transpose("ACT", "ALT", "SPE")
+        arranged, gain = xr.align(arranged, gains.image(), join="exact", copy=False)
+        dtype = np.result_type(arranged.dtype, gain.dtype)
+        dtype = np.float32 if dtype == np.float32 else np.float64
+        values = native_module().apply_striping(
+            np.ascontiguousarray(arranged.values, dtype=dtype),
+            np.ascontiguousarray(gain.transpose("ACT", "SPE").values, dtype=dtype),
+            threads,
+        )
+        return image_t(arranged.copy(deep=False, data=values).transpose(*source.dims))
     # Xarray matches ACT and SPE by name and repeats each gain along the missing ALT axis.
     values = (source * gains.image()).transpose(*source.dims)
     return image_t(source.copy(data=values.data))
+
+
+apply_striping.cuda_support = True
+apply_striping.dask_support = True
+apply_striping.input_access = ("read", "read")
 
 
 def select_channels(wavelength_nm, parameters):
@@ -335,61 +763,3 @@ def select_channels(wavelength_nm, parameters):
             "The input wavelength range contains no nominal CHIME channel centres."
         )
     return np.flatnonzero(covered)
-
-
-# EOPAL operation contracts: CPU NumPy implementations; inputs are read-only.
-channel_centres.cuda_support = False
-channel_centres.dask_support = False
-channel_centres.input_access = ("read",)
-
-spectral_response.cuda_support = False
-spectral_response.dask_support = False
-spectral_response.input_access = ("read",)
-
-integrate_spectral.cuda_support = False
-integrate_spectral.dask_support = False
-integrate_spectral.input_access = ("read", "read")
-
-rotate_to_sensor.cuda_support = False
-rotate_to_sensor.dask_support = False
-rotate_to_sensor.input_access = ("read",)
-
-convolve_downsample.cuda_support = False
-convolve_downsample.dask_support = False
-convolve_downsample.input_access = ("read",)
-
-relative_radiance.cuda_support = False
-relative_radiance.dask_support = False
-relative_radiance.input_access = ("read",)
-
-temporal_snr.cuda_support = False
-temporal_snr.dask_support = False
-temporal_snr.input_access = ("read",)
-
-temporal_sigma.cuda_support = False
-temporal_sigma.dask_support = False
-temporal_sigma.input_access = ("read",)
-
-draw_noise.cuda_support = False
-draw_noise.dask_support = False
-draw_noise.input_access = ("read",)
-
-electron_signal.cuda_support = False
-electron_signal.dask_support = False
-electron_signal.input_access = ("read",)
-
-absolute_offset.cuda_support = False
-absolute_offset.dask_support = False
-absolute_offset.input_access = ("read", "read")
-
-apply_absolute_error.cuda_support = False
-apply_absolute_error.dask_support = False
-apply_absolute_error.input_access = ("read", "read", "read")
-
-striping_gains.cuda_support = False
-striping_gains.dask_support = False
-striping_gains.input_access = ("read",)
-
-apply_striping.cuda_support = False
-apply_striping.dask_support = False
-apply_striping.input_access = ("read", "read")

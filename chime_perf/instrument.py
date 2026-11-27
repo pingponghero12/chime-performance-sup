@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
-from eopl import Pipeline, image_t
+from eopl import image_t
 
 from chime_perf.algorithms.acquisition_algorithms import (
     absolute_offset,
@@ -26,6 +26,7 @@ from chime_perf.algorithms.acquisition_algorithms import (
 from chime_perf.algorithms.instrument_algorithms import isrf_sigma, psf_kernel, psf_sigma_px
 from chime_perf.algorithms.ssgm_algorithms import validate_spatial_sampling
 from chime_perf.params import ChimeParams, boundary_settings
+from chime_perf.pipeline import ChimePipeline
 
 
 def instrument(
@@ -36,9 +37,10 @@ def instrument(
     data=None,
     save=True,
     parameters=None,
+    atmosphere=None,
 ):
     """Simulate detector radiance and retain the atmosphere for reconstruction."""
-    pl = Pipeline(output_root=output_root)
+    pl = ChimePipeline(output_root=output_root)
 
     # 1. INITIALIZATION AND CONFIGURATION
     if config_path is not None:
@@ -55,17 +57,17 @@ def instrument(
     if data is None:
         if input_path is None:
             raise ValueError("Supply input_path or an in-memory image through data.")
-        with xr.open_dataset(input_path) as source:
-            data = image_t(source["radiance"].load())
-        pl.manifest["input"] = {"file": str(Path(input_path).resolve())}
+        data = pl.read_radiance(input_path)
+    data = pl.prepare_image(data)
 
     coefficient_path = atmosphere_path if atmosphere_path is not None else input_path
-    if coefficient_path is None:
-        raise ValueError("Supply the saved propagation product through atmosphere_path.")
-    with xr.open_dataset(coefficient_path) as source:
-        atmosphere = source.load()
-
     coefficient_names = ("path_radiance", "spherical_albedo", "transmission", "solar_scale")
+    if atmosphere is None:
+        if coefficient_path is None:
+            raise ValueError("Supply the saved propagation product through atmosphere_path.")
+        with xr.open_dataset(coefficient_path) as source:
+            available = [name for name in coefficient_names if name in source]
+            atmosphere = source[available].load()
     if not all(name in atmosphere for name in coefficient_names):
         raise ValueError("The propagation product must contain the saved P, S, T and C.")
 
@@ -248,7 +250,8 @@ def instrument(
         pl.add_variable("temporal_noise", noise.image(), pinned=True)
         pl.add_variable("rxra_gain", gains.image(), pinned=True)
         pl.add_variable("valid", np.isfinite(data.image()), pinned=True)
-        pl.manifest["atmosphere_source"] = str(Path(coefficient_path).resolve())
+        if coefficient_path is not None:
+            pl.manifest["atmosphere_source"] = str(Path(coefficient_path).resolve())
         pl.save_output(image_t(data.image(), name="radiance"), "instrument")
         pl.log.info(f"Detector radiance saved to {Path(output_root) / 'instrument.nc'}")
 

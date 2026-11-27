@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
-from eopl import Pipeline, image_t
+from eopl import image_t
 
 from chime_perf.algorithms.acquisition_algorithms import spectral_response
 from chime_perf.algorithms.instrument_algorithms import isrf_sigma
@@ -16,6 +16,7 @@ from chime_perf.algorithms.reconstruction_algorithms import (
     toa_reflectance,
 )
 from chime_perf.params import boundary_settings
+from chime_perf.pipeline import ChimePipeline
 
 
 def reconstruction(
@@ -25,9 +26,10 @@ def reconstruction(
     atmosphere_path=None,
     data=None,
     save=True,
+    atmosphere=None,
 ):
     """Retrieve BOA reflectance without invoking an atmospheric solver."""
-    pl = Pipeline(output_root=output_root)
+    pl = ChimePipeline(output_root=output_root)
 
     # 1. INITIALIZATION AND CONFIGURATION
     if config_path is not None:
@@ -41,13 +43,15 @@ def reconstruction(
 
     boundaries = boundary_settings(pl.local_config)
     product = None
+    names = ("path_radiance", "spherical_albedo", "transmission", "solar_scale")
     if data is None:
         if input_path is None:
             raise ValueError("Supply input_path or an in-memory image through data.")
+        data = pl.read_radiance(input_path)
         with xr.open_dataset(input_path) as source:
-            product = source.load()
-        data = image_t(product["radiance"])
-        pl.manifest["input"] = {"file": str(Path(input_path).resolve())}
+            available = [name for name in (*names, "nominal_fwhm") if name in source]
+            product = source[available].load()
+    data = pl.prepare_image(data)
 
     image = data.image().transpose("ACT", "ALT", "SPE")
     if image.attrs.get("units") != "W m-2 sr-1 um-1":
@@ -58,16 +62,20 @@ def reconstruction(
 
     # The archive is either embedded in the instrument product or supplied for
     # an in-memory handoff. YAML atmosphere settings never replace saved quantities.
-    coefficient_path = atmosphere_path if atmosphere_path is not None else input_path
-    if atmosphere_path is not None or product is None:
-        if coefficient_path is None:
-            raise ValueError("Supply the saved propagation product through atmosphere_path.")
-        with xr.open_dataset(coefficient_path) as source:
-            atmosphere = source.load()
-    else:
-        atmosphere = product
+    coefficient_path = None
+    if atmosphere is None:
+        coefficient_path = atmosphere_path if atmosphere_path is not None else input_path
+        if atmosphere_path is not None or product is None:
+            if coefficient_path is None:
+                raise ValueError(
+                    "Supply the saved propagation product through atmosphere_path."
+                )
+            with xr.open_dataset(coefficient_path) as source:
+                available = [name for name in names if name in source]
+                atmosphere = source[available].load()
+        else:
+            atmosphere = product
 
-    names = ("path_radiance", "spherical_albedo", "transmission", "solar_scale")
     if not all(name in atmosphere for name in names):
         raise ValueError("Reconstruction requires the saved P, S, T and C quantities.")
     axis = "atmosphere_SPE" if "atmosphere_SPE" in atmosphere.dims else "SPE"
@@ -146,7 +154,9 @@ def reconstruction(
             pl.add_variable(f"band_{name}", channels[name].image(), pinned=True)
 
         pl.add_variable("valid", np.isfinite(data.image()), pinned=True)
-        pl.manifest["atmosphere_source"] = str(Path(coefficient_path).resolve())
+        pl.manifest["atmosphere_source"] = (
+            str(Path(coefficient_path).resolve()) if coefficient_path is not None else "in memory"
+        )
         pl.save_output(image_t(data.image(), name="reflectance"), "reconstructed")
         pl.log.info(f"BOA reflectance saved to {Path(output_root) / 'reconstructed.nc'}")
 

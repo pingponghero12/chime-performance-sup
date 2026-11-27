@@ -1,0 +1,243 @@
+"""CuPy helpers and CUDA kernels for the CHIME image operations."""
+
+from functools import lru_cache
+from math import prod
+from pathlib import Path
+
+import numpy as np
+import xarray as xr
+from eopl.data import require_cupy
+
+
+def on_device(value):
+    """Move a small coefficient to the device and retain any named axes."""
+    if np.isscalar(value):
+        return value
+    cp = require_cupy()
+    if isinstance(value, xr.DataArray):
+        return value.copy(deep=False, data=cp.asarray(value.data))
+    return cp.asarray(value)
+
+
+@lru_cache
+def atmosphere_kernel():
+    cp = require_cupy()
+    return cp.ElementwiseKernel(
+        "T rho, T path, T gain, T albedo, T missing",
+        "T radiance",
+        """
+        const T denominator = T(1) - albedo * rho;
+        if (isfinite(rho) && rho >= T(0) && denominator > T(0)) {
+            radiance = path + gain * rho / denominator;
+        } else {
+            radiance = missing;
+        }
+        """,
+        "chime_propagate_atmosphere",
+        options=("--fmad=false",),
+    )
+
+
+def propagate_cuda(reflectance, path, scale, transmission, albedo):
+    """Apply the Lambertian equation and its validity check in one pass."""
+    cp = require_cupy()
+    source = reflectance.transpose(..., "SPE")
+    dtype = np.result_type(
+        np.float32, source.dtype, path.dtype, scale.dtype, transmission.dtype, albedo.dtype
+    )
+
+    # Compute the combined gain once per wavelength. CuPy broadcasts the
+    # coefficient vectors over the spatial axes without expanding them.
+    gain = scale * transmission
+    values = atmosphere_kernel()(
+        cp.asarray(source.data, dtype=dtype),
+        cp.asarray(path.data, dtype=dtype),
+        cp.asarray(gain.data, dtype=dtype),
+        cp.asarray(albedo.data, dtype=dtype),
+        dtype.type(np.nan),
+    )
+    return source.copy(deep=False, data=values).transpose(*reflectance.dims)
+
+
+@lru_cache
+def nnls_kernel():
+    cp = require_cupy()
+    source = Path(__file__).with_name("cuda") / "nnls.cu"
+    return cp.RawKernel(source.read_text(), "fit_nnls", options=("--fmad=false",))
+
+
+def fit_library_cuda(source, measured):
+    """Project onto the library span and solve each pixel's NNLS on device."""
+    cp = require_cupy()
+    bands, materials = measured.shape
+    if bands == 0 or materials == 0 or source.shape[-1] != bands:
+        raise ValueError("Expected a nonempty library on the measured bands.")
+
+    # For A = Q R, the part of b perpendicular to Q adds a constant to the
+    # residual. Solve the smaller problem ||R x - Q.T b|| with the same x.
+    q, r = cp.linalg.qr(cp.asarray(measured, dtype=cp.float64), mode="reduced")
+    rows = r.shape[0]
+    r = cp.ascontiguousarray(r)
+    source = cp.asarray(source, order="C")
+    pixels = source.reshape(-1, bands)
+    weights = cp.empty((len(pixels), materials), dtype=cp.float64)
+    failed = cp.zeros(1, dtype=cp.int32)
+    scale = np.max(np.abs(measured))
+    eps = np.finfo(np.float64).eps
+    rank_tolerance = np.float64(eps * max(bands, materials) * scale)
+    zero_scale = np.float64(10 * eps / (scale or 1))
+
+    double_workspace = rows * materials + 2 * rows + materials
+    index_workspace = 2 * materials
+    bytes_per_pixel = 8 * (double_workspace + bands + rows) + 4 * index_workspace
+    batch = max(1, min(len(pixels), 2**26 // bytes_per_pixel))
+    scratch = cp.empty((batch, double_workspace), dtype=cp.float64)
+    indices = cp.empty((batch, index_workspace), dtype=cp.int32)
+    solve = nnls_kernel()
+    for start in range(0, len(pixels), batch):
+        block = pixels[start : start + batch]
+        projected = cp.ascontiguousarray(block.astype(cp.float64, copy=False) @ q)
+        count = len(block)
+        solve(
+            ((count + 127) // 128,), (128,),
+            (
+                projected, r, weights[start : start + count], np.int32(count),
+                np.int32(rows), np.int32(materials), rank_tolerance, zero_scale, np.float64(np.nan),
+                scratch, indices, failed,
+            ),
+        )
+    if failed.item():
+        raise RuntimeError("The CUDA NNLS fit did not converge.")
+    return weights.reshape((*source.shape[:-1], materials))
+
+
+def reconstruct_library_cuda(weights, spectra, output_float32):
+    """Accumulate the weighted spectra in double precision and round by batch."""
+    cp = require_cupy()
+    weights = cp.asarray(weights)
+    if not output_float32:
+        return weights @ cp.asarray(spectra)
+
+    spectra = cp.asarray(spectra, dtype=cp.float64)
+    pixels = cp.ascontiguousarray(weights).reshape(-1, weights.shape[-1])
+    result = cp.empty((len(pixels), spectra.shape[1]), dtype=cp.float32)
+    batch = max(1, 2**26 // (8 * (pixels.shape[1] + spectra.shape[1])))
+    for start in range(0, len(pixels), batch):
+        block = slice(start, start + batch)
+        result[block] = pixels[block].astype(cp.float64, copy=False) @ spectra
+    return result.reshape((*weights.shape[:-1], spectra.shape[1]))
+
+
+@lru_cache
+def sampling_module():
+    cp = require_cupy()
+    source = Path(__file__).with_name("cuda") / "sampling.cu"
+    names = [
+        f"{kernel}<{source_type}, {result_type}>"
+        for kernel in (
+            "interpolate_spectra", "interpolate_axis", "integrate_spectra", "convolve_centres"
+        )
+        for source_type in ("float", "double")
+        for result_type in ("float", "double")
+    ]
+    return cp.RawModule(
+        code=source.read_text(), options=("--std=c++11", "--fmad=false"),
+        name_expressions=names,
+    )
+
+
+def launch_sampling(name, source, shape, *arguments, output_float32=False):
+    cp = require_cupy()
+    input_type = "float" if source.dtype == np.float32 else "double"
+    output_type = "float" if output_float32 else "double"
+    dtype = np.float32 if input_type == "float" else np.float64
+    source = cp.ascontiguousarray(source, dtype=dtype)
+    result = cp.empty(shape, dtype=np.float32 if output_float32 else np.float64)
+    size = prod(shape)
+
+    if size:
+        kernel = sampling_module().get_function(f"{name}<{input_type}, {output_type}>")
+        block_size = 256
+        kernel(
+            ((size + block_size - 1) // block_size,), (block_size,),
+            (source, result, np.int64(size), *arguments),
+        )
+    return result
+
+
+def interpolate_spectral_cuda(source, original, target, output_float32):
+    cp = require_cupy()
+    lower = np.clip(np.searchsorted(original, target, side="right") - 1, 0, original.size - 2)
+    left = target - original[lower]
+    right = target - original[lower + 1]
+    upper_edge = right >= 0
+    endpoint = (left <= 0) | upper_edge
+
+    # In exact-band cases the kernel reads only the chosen source sample.
+    return launch_sampling(
+        "interpolate_spectra", source, (*source.shape[:2], target.size),
+        np.int64(original.size), np.int64(target.size),
+        cp.asarray(lower + upper_edge, dtype=np.int64),
+        cp.asarray(original[lower + 1] - original[lower]),
+        cp.asarray(np.where(endpoint, 0, left)), cp.asarray(right),
+        output_float32=output_float32,
+    )
+
+
+def interpolate_spatial_cuda(source, original, target, axis):
+    cp = require_cupy()
+    lower = np.clip(np.searchsorted(original, target), 1, original.size - 1) - 1
+    shape = list(source.shape)
+    shape[axis] = target.size
+    return launch_sampling(
+        "interpolate_axis", source, shape,
+        np.int64(source.shape[1]), np.int64(source.shape[2]),
+        np.int64(shape[1]), np.int32(axis),
+        cp.asarray(lower, dtype=np.int64),
+        cp.asarray(original[lower + 1] - original[lower], dtype=float),
+        cp.asarray(target - original[lower], dtype=float),
+    )
+
+
+def integrate_spectral_cuda(source, columns, weights, column_ids, output_float32):
+    cp = require_cupy()
+    if (
+        weights.ndim != 3
+        or weights.shape[0] != column_ids.size
+        or weights.shape[-1] != source.shape[-1]
+        or columns.shape != source.shape[:2]
+    ):
+        raise ValueError("Spectral response and detector columns must match the image.")
+    order = np.argsort(column_ids)
+    sorted_ids = column_ids[order]
+    rows = np.searchsorted(sorted_ids, columns)
+    if np.any(rows == sorted_ids.size) or not np.array_equal(sorted_ids[rows], columns):
+        raise ValueError("A detector column is missing its spectral response.")
+    weights = cp.ascontiguousarray(weights, dtype=float)
+    support = weights > 0
+    bands = source.shape[-1]
+    channels = weights.shape[1]
+    first = cp.argmax(support, axis=-1).astype(np.int64)
+    stop = cp.where(support.any(axis=-1), bands - cp.argmax(support[..., ::-1], axis=-1), 0)
+    return launch_sampling(
+        "integrate_spectra", source, (*source.shape[:2], channels),
+        np.int64(bands), np.int64(channels), cp.asarray(order[rows], dtype=np.int64),
+        weights, first, stop.astype(np.int64), output_float32=output_float32,
+    )
+
+
+def convolve_downsample_cuda(source, kernel, shape, factor_act, factor_alt):
+    cp = require_cupy()
+    return launch_sampling(
+        "convolve_centres", source, shape, *(np.int64(n) for n in source.shape),
+        np.int64(shape[1]), np.int64(factor_act), np.int64(factor_alt),
+        cp.asarray(np.ascontiguousarray(kernel)), *(np.int64(n) for n in kernel.shape),
+    )
+
+
+def rotate_to_sensor_cuda(source, act, alt, x, y):
+    cp = require_cupy()
+    from cupyx.scipy.interpolate import RegularGridInterpolator
+
+    interpolate = RegularGridInterpolator((cp.asarray(act), cp.asarray(alt)), source)
+    return interpolate(cp.asarray(np.stack((x, y), axis=-1)))
